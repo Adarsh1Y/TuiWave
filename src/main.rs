@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use lastwave::{config, mpv, tui};
+use lastwave::{backend, config, state, tui};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -16,6 +16,14 @@ struct Args {
     /// Path to the mpv binary.
     #[arg(long)]
     mpv_path: Option<String>,
+
+    /// Restore the previous session (queue, position, history) on start.
+    #[arg(long)]
+    resume: bool,
+
+    /// Start fresh, ignoring any saved session.
+    #[arg(long, conflicts_with = "resume")]
+    no_resume: bool,
 }
 
 fn main() -> Result<()> {
@@ -28,14 +36,25 @@ fn main() -> Result<()> {
     if let Some(p) = args.mpv_path {
         cfg.mpv_path = p;
     }
+    let resume = if args.no_resume {
+        false
+    } else if args.resume {
+        true
+    } else {
+        cfg.resume
+    };
     let cfg = cfg;
+
+    let _lock = state::acquire_single_instance()?;
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
-        let (mpv, mpv_events) = mpv::Mpv::spawn(&cfg).await?;
-        if let Some(chain) = cfg.active_eq_chain().filter(|c| !c.is_empty()) {
-            let _ = mpv.set_af(&chain).await;
+        let (backend_engine, backend_events) = backend::Backend::spawn(&cfg).await?;
+        if backend_engine.supports_eq()
+            && let Some(chain) = cfg.active_eq_chain().filter(|c| !c.is_empty())
+        {
+            let _ = backend_engine.set_af(&chain).await;
         }
-        tui::run(&cfg, mpv, mpv_events).await
+        tui::run(&cfg, backend_engine, backend_events, resume).await
     })
 }

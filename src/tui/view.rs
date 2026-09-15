@@ -23,6 +23,7 @@ pub fn draw(frame: &mut Frame, data: &ViewData, mode: Mode) {
         Mode::Playlists => draw_playlists(frame, data),
         Mode::PlaylistDetail => draw_playlist_detail(frame, data),
         Mode::Local => draw_local(frame, data),
+        Mode::History => draw_history(frame, data),
     }
     if let Some(toast) = &data.toast {
         draw_toast(frame, toast);
@@ -90,7 +91,7 @@ fn draw_search(frame: &mut Frame, data: &ViewData) {
     frame.set_cursor_position((chunks[0].x + 2 + data.query.len() as u16, chunks[0].y + 1));
 
     frame.render_widget(
-        footer("type: query   enter: play   alt+l: like   esc: back   ctrl+c: quit"),
+        footer("type: query   enter: play   alt+l: like   alt+h: history   esc: back   ctrl+c: quit"),
         chunks[1],
     );
 
@@ -218,6 +219,7 @@ fn draw_now_playing(frame: &mut Frame, data: &ViewData) {
         Span::styled("alt+z shuffle  ", Style::default().fg(Color::Blue)),
         Span::styled("alt+e/alt+x eq  ", Style::default().fg(Color::Blue)),
         Span::styled("s search  ", Style::default().fg(Color::Blue)),
+        Span::styled("alt+h history  ", Style::default().fg(Color::Blue)),
         Span::styled("q quit", Style::default().fg(Color::Blue)),
         Span::styled("  ", Style::default().fg(Color::DarkGray)),
         Span::styled(data.eq.clone(), Style::default().fg(Color::Cyan)),
@@ -517,6 +519,54 @@ fn draw_local(frame: &mut Frame, data: &ViewData) {
             chunks[1],
             &mut ratatui::widgets::ListState::default().with_selected(Some(
                 data.local_cursor.min(data.local_tracks.len().saturating_sub(1)),
+            )),
+        );
+    }
+
+    frame.render_widget(
+        footer("enter: play   alt+l: like   j/k: move   esc: back"),
+        chunks[2],
+    );
+}
+
+fn draw_history(frame: &mut Frame, data: &ViewData) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    frame.render_widget(
+        Paragraph::new(format!("{} recently played", data.history.len()))
+            .block(Block::default().borders(Borders::ALL).title(" History ")),
+        chunks[0],
+    );
+
+    let items: Vec<ListItem> = data
+        .history
+        .iter()
+        .map(|t| ListItem::new(track_line(t, data.liked_keys.contains(&t.key()), true)))
+        .collect();
+
+    if data.history.is_empty() {
+        frame.render_widget(
+            Paragraph::new("nothing played yet — search and play something (s)")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center),
+            chunks[1],
+        );
+    } else {
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(" Tracks "))
+                .highlight_style(Style::default().bg(HIGHLIGHT))
+                .highlight_symbol("▶ "),
+            chunks[1],
+            &mut ratatui::widgets::ListState::default().with_selected(Some(
+                data.history_cursor.min(data.history.len().saturating_sub(1)),
             )),
         );
     }

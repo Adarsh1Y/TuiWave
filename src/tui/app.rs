@@ -6,13 +6,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 
 use crate::art::Art;
+use crate::backend::{Backend, Event};
 use crate::config::Config;
 use crate::innertube;
 use crate::innertube::StreamFormat;
 use crate::library;
 use crate::model::{Track, TrackSource};
-use crate::mpv::{Mpv, MpvEvent};
 use crate::playlists;
+use crate::state::Session;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -24,6 +25,7 @@ pub enum Mode {
     Playlists,
     PlaylistDetail,
     Local,
+    History,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,8 +34,9 @@ pub enum PromptKind {
     LoadYtPlaylist,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum RepeatMode {
+    #[default]
     Off,
     All,
     One,
@@ -57,7 +60,7 @@ pub enum AppEvent {
         track_video_id: String,
         art: Option<Art>,
     },
-    Mpv(MpvEvent),
+    Playback(Event),
 }
 
 /// True when `key` is `Alt+<c>`.
@@ -81,7 +84,7 @@ pub struct App {
     pub shuffle: bool,
     pub repeat: RepeatMode,
     pub toast: Option<(String, Instant)>,
-    pub mpv: Mpv,
+    pub backend: Backend,
     pub events: mpsc::UnboundedSender<AppEvent>,
     search_seq: u64,
 
@@ -94,11 +97,15 @@ pub struct App {
     pub local_cursor: usize,
     pub prompt: String,
     pub prompt_kind: PromptKind,
+    pub history: Vec<Track>,
+    pub history_cursor: usize,
+    pub last_query: String,
+    resume_position: Option<f64>,
     retry_pending: bool,
 }
 
 impl App {
-    pub fn new(cfg: Config, mpv: Mpv, events: mpsc::UnboundedSender<AppEvent>) -> Self {
+    pub fn new(cfg: Config, backend: Backend, events: mpsc::UnboundedSender<AppEvent>) -> Self {
         let liked = playlists::load_liked().unwrap_or_default();
         Self {
             cfg,
@@ -114,7 +121,7 @@ impl App {
             shuffle: false,
             repeat: RepeatMode::Off,
             toast: None,
-            mpv,
+            backend,
             events,
             search_seq: 0,
             liked,
@@ -126,12 +133,27 @@ impl App {
             local_cursor: 0,
             prompt: String::new(),
             prompt_kind: PromptKind::SaveQueue,
+            history: Vec::new(),
+            history_cursor: 0,
+            last_query: String::new(),
+            resume_position: None,
             retry_pending: false,
         }
     }
 
     pub fn show_toast(&mut self, message: impl Into<String>) {
         self.toast = Some((message.into(), Instant::now()));
+    }
+
+    /// Remember a started track (most recent first), de-duplicated, capped.
+    pub fn record_history(&mut self, track: &Track) {
+        if let Some(last) = self.history.first()
+            && last.key() == track.key()
+        {
+            return;
+        }
+        self.history.insert(0, track.clone());
+        self.history.truncate(100);
     }
 
     pub fn is_liked(&self, track: &Track) -> bool {
@@ -209,9 +231,15 @@ impl App {
                         self.current_codec = Some(stream.display());
                         let title = format!("{} - {}", track.artist, track.title);
                         let url = stream.url.clone();
-                        let mpv = self.mpv.clone();
+                        let backend = self.backend.clone();
+                        let resume_seek = self.take_resume_seek();
                         tokio::spawn(async move {
-                            let _ = mpv.load(&url, &title, false).await;
+                            if backend.load(&url, &title, false).await.is_ok()
+                                && let Some(pos) = resume_seek
+                            {
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                let _ = backend.seek(pos, true).await;
+                            }
                         });
                         self.fetch_art_async(&track);
                     }
@@ -251,7 +279,7 @@ impl App {
                     self.current_art = art;
                 }
             }
-            AppEvent::Mpv(MpvEvent::EndFile { reason }) => {
+            AppEvent::Playback(Event::EndFile { reason }) => {
                 match reason.as_str() {
                     "eof" | "end-of-file" => {
                         self.retry_pending = false;
@@ -271,11 +299,22 @@ impl App {
                     _ => {}
                 }
             }
-            AppEvent::Mpv(MpvEvent::FileLoaded) | AppEvent::Mpv(MpvEvent::StateChanged) => {}
+            AppEvent::Playback(Event::FileLoaded) => {
+                if let Some(pos) = self.resume_position.take() {
+                    let backend = self.backend.clone();
+                    tokio::spawn(async move {
+                        let _ = backend.seek(pos, true).await;
+                    });
+                }
+            }
+            AppEvent::Playback(Event::StateChanged) => {}
         }
     }
 
     pub fn start_search_seq(&mut self, query: String) {
+        if !query.is_empty() {
+            self.last_query = query.clone();
+        }
         self.search_seq = self.search_seq.wrapping_add(1);
         let seq = self.search_seq;
         let q = query.clone();
@@ -318,17 +357,24 @@ impl App {
         let Some(track) = self.queue.get(self.cursor).cloned() else {
             return;
         };
+        self.record_history(&track);
         self.current = Some(track.clone());
         self.current_art = None;
         self.current_codec = None;
 
-        // Local files play directly through mpv — no stream resolution.
+        // Local files play directly through the backend — no stream resolution.
         if let TrackSource::LocalFile(path) = &track.source {
             let title = format!("{} - {}", track.artist, track.title);
-            let mpv = self.mpv.clone();
+            let backend = self.backend.clone();
             let path = path.clone();
+            let resume_seek = self.take_resume_seek();
             tokio::spawn(async move {
-                let _ = mpv.load(&path.to_string_lossy(), &title, false).await;
+                if backend.load(&path.to_string_lossy(), &title, false).await.is_ok()
+                    && let Some(pos) = resume_seek
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    let _ = backend.seek(pos, true).await;
+                }
             });
             return;
         }
@@ -422,14 +468,18 @@ impl App {
 
     /// Toggle the active EQ preset on/off. Requires mpv's `af` filter.
     pub async fn toggle_eq(&mut self) -> Result<()> {
+        if !self.backend.supports_eq() {
+            self.show_toast("EQ requires the mpv backend");
+            return Ok(());
+        }
         let active = self.cfg.eq.preset.is_some();
         if active {
             self.cfg.eq.preset = None;
-            self.mpv.set_af("").await?;
+            self.backend.set_af("").await?;
             self.show_toast("EQ: clean");
         } else if let Some(chain) = self.cfg.active_eq_chain() {
             let preset_name = self.cfg.eq.preset.clone().unwrap_or_default();
-            self.mpv.set_af(&chain).await?;
+            self.backend.set_af(&chain).await?;
             self.show_toast(format!("EQ: {preset_name}"));
         } else {
             self.show_toast("no EQ presets configured");
@@ -442,8 +492,12 @@ impl App {
 
     /// Force the EQ back to clean/unfiltered.
     pub async fn clear_eq(&mut self) -> Result<()> {
+        if !self.backend.supports_eq() {
+            self.show_toast("EQ requires the mpv backend");
+            return Ok(());
+        }
         self.cfg.eq.preset = None;
-        self.mpv.set_af("").await?;
+        self.backend.set_af("").await?;
         self.show_toast("EQ: clean");
         if let Err(e) = self.cfg.save() {
             self.show_toast(format!("config write failed: {e}"));
@@ -578,11 +632,16 @@ impl App {
             Mode::Playlists => self.handle_playlists_key(key)?,
             Mode::PlaylistDetail => self.handle_playlist_detail_key(key)?,
             Mode::Local => self.handle_local_key(key)?,
+            Mode::History => self.handle_history_key(key)?,
         }
         Ok(())
     }
 
     async fn handle_search_key(&mut self, key: KeyEvent) -> Result<()> {
+        if alt(&key, 'h') {
+            self.mode = Mode::History;
+            return Ok(());
+        }
         if alt(&key, 'l') {
             self.like_context();
             return Ok(());
@@ -630,6 +689,10 @@ impl App {
                 self.query.pop();
                 self.start_search_seq(self.query.clone());
             }
+            KeyCode::Up if self.query.is_empty() && !self.last_query.is_empty() => {
+                self.query = self.last_query.clone();
+                self.start_search_seq(self.query.clone());
+            }
             KeyCode::Up => self.selected = self.selected.saturating_sub(1),
             KeyCode::Down => {
                 self.selected = (self.selected + 1).min(self.results.len().saturating_sub(1));
@@ -647,6 +710,9 @@ impl App {
     }
 
     async fn handle_now_playing_key(&mut self, key: KeyEvent) -> Result<()> {
+        if alt(&key, 'h') {
+            self.mode = Mode::History;
+        }
         if alt(&key, 'l') {
             self.like_context();
         }
@@ -691,6 +757,13 @@ impl App {
         if alt(&key, 'z') {
             self.toggle_shuffle();
         }
+        if alt(&key, 'a') {
+            match self.backend.next_audio_output().await {
+                Ok(Some(desc)) => self.show_toast(format!("audio: {desc}")),
+                Ok(None) => self.show_toast("no other audio outputs"),
+                Err(e) => self.show_toast(format!("audio switch failed: {e}")),
+            }
+        }
         match key.code {
             KeyCode::Char('q') => anyhow::bail!("quit"),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -698,32 +771,32 @@ impl App {
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('s') | KeyCode::Char('/') => self.mode = Mode::Search,
-            KeyCode::Char(' ') => self.mpv.play_pause().await?,
+            KeyCode::Char(' ') => self.backend.play_pause().await?,
             KeyCode::Left => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.mpv.seek(-60.0, false).await?;
+                    self.backend.seek(-60.0, false).await?;
                 } else {
-                    self.mpv.seek(-10.0, false).await?;
+                    self.backend.seek(-10.0, false).await?;
                 }
             }
             KeyCode::Right => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.mpv.seek(60.0, false).await?;
+                    self.backend.seek(60.0, false).await?;
                 } else {
-                    self.mpv.seek(10.0, false).await?;
+                    self.backend.seek(10.0, false).await?;
                 }
             }
             KeyCode::Char(',') => {
-                let st = self.mpv.state();
+                let st = self.backend.state();
                 let s = st.read().await;
                 let vol = s.volume - 5.0;
-                self.mpv.set_volume(vol).await?;
+                self.backend.set_volume(vol).await?;
             }
             KeyCode::Char('.') => {
-                let st = self.mpv.state();
+                let st = self.backend.state();
                 let s = st.read().await;
                 let vol = s.volume + 5.0;
-                self.mpv.set_volume(vol).await?;
+                self.backend.set_volume(vol).await?;
             }
             _ => {}
         }
@@ -898,6 +971,44 @@ impl App {
         Ok(())
     }
 
+    fn handle_history_key(&mut self, key: KeyEvent) -> Result<()> {
+        if alt(&key, 'l')
+            && let Some(t) = self.history.get(self.history_cursor).cloned()
+        {
+            self.toggle_like(&t);
+        }
+        if alt(&key, 'h') {
+            self.mode = Mode::NowPlaying;
+            return Ok(());
+        }
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::NowPlaying,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.history_cursor = self.history_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.history_cursor =
+                    (self.history_cursor + 1).min(self.history.len().saturating_sub(1));
+            }
+            KeyCode::Enter => self.play_history_item(self.history_cursor),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    pub fn play_history_item(&mut self, idx: usize) {
+        if idx >= self.history.len() {
+            return;
+        }
+        self.queue.clear();
+        for t in &self.history[idx..] {
+            self.queue.push_back(t.clone());
+        }
+        self.cursor = 0;
+        self.mode = Mode::NowPlaying;
+        self.play_current();
+    }
+
     pub fn is_toast_stale(&self) -> bool {
         self.toast
             .as_ref()
@@ -929,6 +1040,64 @@ impl App {
             prompt: self.prompt.clone(),
             prompt_kind: self.prompt_kind,
             eq: self.eq_state(),
+            history: self.history.clone(),
+            history_cursor: self.history_cursor,
+        }
+    }
+
+    /// Writer for the on-disk session: queue + playback position + flags.
+    pub fn persist_session(&self, playback: &crate::mpv::PlaybackState) {
+        let session = Session {
+            queue: self.queue.iter().cloned().collect(),
+            cursor: self.cursor,
+            current: self.current.clone(),
+            repeat: self.repeat,
+            shuffle: self.shuffle,
+            query: self.query.clone(),
+            position: playback.time_pos.unwrap_or(0.0),
+            volume: playback.volume,
+            history: self.history.clone(),
+        };
+        if session.queue.is_empty() && session.current.is_none() && session.history.is_empty() {
+            Session::clear();
+        } else {
+            session.save();
+        }
+    }
+
+    /// Restore persisted playback+UI state (queue, position, flags, ...).
+    /// Take the pending resume-seek position — for the MPD backend, which has no
+    /// `FileLoaded` event to trigger the seek on.
+    fn take_resume_seek(&mut self) -> Option<f64> {
+        if self.backend.is_mpv() {
+            None
+        } else {
+            self.resume_position.take()
+        }
+    }
+
+    pub fn apply_session(&mut self, session: &Session) {
+        if !session.queue.is_empty() {
+            self.queue = session.queue.iter().cloned().collect();
+            self.cursor = session.cursor.min(self.queue.len().saturating_sub(1));
+            if let Some(cur) = &session.current
+                && let Some(i) = self.queue.iter().position(|t| t.video_id == cur.video_id)
+            {
+                self.cursor = i;
+            }
+        }
+        self.repeat = session.repeat;
+        self.shuffle = session.shuffle;
+        if !session.history.is_empty() {
+            self.history = session.history.clone();
+        }
+        let q = session.query.clone();
+        if !q.is_empty() {
+            self.last_query = q.clone();
+            self.query = q;
+        }
+        if session.position > 3.0 && !self.queue.is_empty() {
+            self.resume_position = Some(session.position);
         }
     }
 }
@@ -956,6 +1125,8 @@ pub struct ViewData {
     pub prompt: String,
     pub prompt_kind: PromptKind,
     pub eq: String,
+    pub history: Vec<Track>,
+    pub history_cursor: usize,
 }
 
 async fn search_inner(query: &str) -> Result<Vec<Track>> {

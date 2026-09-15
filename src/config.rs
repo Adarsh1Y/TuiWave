@@ -2,6 +2,36 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BackendKind {
+    #[serde(rename = "mpv")]
+    #[default]
+    Mpv,
+    #[serde(rename = "mpd")]
+    Mpd,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MpdConfig {
+    /// Prefer a Unix socket when set (`/run/user/1000/mpd/socket`).
+    pub socket: Option<PathBuf>,
+    pub host: String,
+    pub port: u16,
+    /// Optional MPD password sent on connect.
+    pub password: Option<String>,
+}
+
+impl Default for MpdConfig {
+    fn default() -> Self {
+        Self {
+            socket: None,
+            host: "127.0.0.1".to_string(),
+            port: 6600,
+            password: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Codec {
     #[serde(rename = "best")]
@@ -71,6 +101,19 @@ pub struct Config {
     pub local_dirs: Vec<PathBuf>,
     #[serde(default)]
     pub eq: EqConfig,
+    /// Restore the previous queue/position on startup.
+    #[serde(default = "resume_default")]
+    pub resume: bool,
+    /// Playback engine: `mpv` (default) or a running `mpd` daemon.
+    #[serde(default)]
+    pub backend: BackendKind,
+    /// MPD connection settings, used when `backend = "mpd"`.
+    #[serde(default)]
+    pub mpd: MpdConfig,
+}
+
+fn resume_default() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -85,6 +128,9 @@ impl Default for Config {
             codec: Codec::default(),
             local_dirs: vec![dirs::audio_dir().unwrap_or_else(|| PathBuf::from("~/Music"))],
             eq: EqConfig::default(),
+            resume: true,
+            backend: BackendKind::default(),
+            mpd: MpdConfig::default(),
         }
     }
 }

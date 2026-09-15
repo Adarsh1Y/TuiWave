@@ -192,6 +192,43 @@ impl Mpv {
         })
     }
 
+    /// Cycle to the next entry in `audio-device-list`; returns the new
+    /// device's description (None when there's nowhere to cycle).
+    pub async fn next_audio_output(&self) -> anyhow::Result<Option<String>> {
+        let list = self
+            .command_raw(json!(["get_property", "audio-device-list"]))
+            .await?;
+        let current = self
+            .command_raw(json!(["get_property", "audio-device"]))
+            .await?;
+        let current = current.as_str().unwrap_or("auto").to_string();
+        let items: Vec<Value> = list.as_array().cloned().unwrap_or_default();
+        let mut names = Vec::new();
+        for it in &items {
+            if let Some(n) = it.get("name").and_then(Value::as_str) {
+                names.push(n.to_string());
+            }
+        }
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let idx = names.iter().position(|n| *n == current);
+        let next_idx = match idx {
+            Some(i) => (i + 1) % names.len(),
+            None => 0,
+        };
+        if names[next_idx] == current {
+            return Ok(None);
+        }
+        self.command_raw(json!(["set_property", "audio-device", names[next_idx]]))
+            .await?;
+        let desc = items[next_idx]
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(&names[next_idx]);
+        Ok(Some(desc.to_string()))
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.command_raw(json!(["quit", 0])).await;
     }

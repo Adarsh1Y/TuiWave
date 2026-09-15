@@ -1,8 +1,11 @@
 pub mod art;
+pub mod backend;
 pub mod config;
 pub mod innertube;
 pub mod library;
 pub mod model;
+pub mod mpd;
 pub mod mpv;
 pub mod playlists;
+pub mod state;
 pub mod tui;
