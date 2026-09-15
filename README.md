@@ -32,6 +32,15 @@ bot-gating outpaces the direct resolver.
 
 ## Installation
 
+### One-liner (recommended)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Adarsh1Y/TuiWave/main/install.sh | sh
+```
+
+Installs the latest prebuilt binary to `~/.local/bin/lastwave`.
+Works on x86_64 and arm64 Linux, no Rust toolchain needed.
+
 ### Prerequisites
 
 Install `mpv` with your package manager:
