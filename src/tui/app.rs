@@ -60,6 +60,13 @@ pub enum AppEvent {
     Mpv(MpvEvent),
 }
 
+/// True when `key` is `Alt+<c>`.
+///
+/// Rule everywhere: bare letters type, `Alt+letter` acts.
+fn alt(key: &KeyEvent, c: char) -> bool {
+    key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char(c)
+}
+
 pub struct App {
     pub cfg: Config,
     pub mode: Mode,
@@ -576,6 +583,47 @@ impl App {
     }
 
     async fn handle_search_key(&mut self, key: KeyEvent) -> Result<()> {
+        if alt(&key, 'l') {
+            self.like_context();
+            return Ok(());
+        }
+        if alt(&key, 'o') || alt(&key, 't') {
+            self.mode = Mode::Queue;
+            return Ok(());
+        }
+        if alt(&key, 'L') {
+            self.open_playlist(None);
+            return Ok(());
+        }
+        if alt(&key, 'P') {
+            self.enter_playlists();
+            return Ok(());
+        }
+        if alt(&key, 'y') {
+            self.prompt = String::new();
+            self.prompt_kind = PromptKind::LoadYtPlaylist;
+            self.mode = Mode::Prompt;
+            return Ok(());
+        }
+        if alt(&key, 'S') {
+            self.prompt = String::new();
+            self.prompt_kind = PromptKind::SaveQueue;
+            self.mode = Mode::Prompt;
+            return Ok(());
+        }
+        if alt(&key, 'u') {
+            self.refresh_local();
+            self.mode = Mode::Local;
+            return Ok(());
+        }
+        if alt(&key, 'e') {
+            self.toggle_eq().await?;
+            return Ok(());
+        }
+        if alt(&key, 'x') {
+            self.clear_eq().await?;
+            return Ok(());
+        }
         match key.code {
             KeyCode::Esc => self.mode = Mode::NowPlaying,
             KeyCode::Backspace => {
@@ -587,28 +635,9 @@ impl App {
                 self.selected = (self.selected + 1).min(self.results.len().saturating_sub(1));
             }
             KeyCode::Enter => self.play_selection(),
-            KeyCode::Char('?') => self.mode = Mode::Help,
-            KeyCode::Char('l') => self.like_context(),
-            KeyCode::Char('o') | KeyCode::Char('t') => self.mode = Mode::Queue,
-            KeyCode::Char('L') => self.open_playlist(None),
-            KeyCode::Char('P') => self.enter_playlists(),
-            KeyCode::Char('y') => {
-                self.prompt = String::new();
-                self.prompt_kind = PromptKind::LoadYtPlaylist;
-                self.mode = Mode::Prompt;
-            }
-            KeyCode::Char('S') => {
-                self.prompt = String::new();
-                self.prompt_kind = PromptKind::SaveQueue;
-                self.mode = Mode::Prompt;
-            }
-            KeyCode::Char('u') => {
-                self.refresh_local();
-                self.mode = Mode::Local;
-            }
-            KeyCode::Char('e') => self.toggle_eq().await?,
-            KeyCode::Char('x') => self.clear_eq().await?,
-            KeyCode::Char(c) if !c.is_control() => {
+            KeyCode::Char(c)
+                if !c.is_control() && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 self.query.push(c);
                 self.start_search_seq(self.query.clone());
             }
@@ -618,6 +647,50 @@ impl App {
     }
 
     async fn handle_now_playing_key(&mut self, key: KeyEvent) -> Result<()> {
+        if alt(&key, 'l') {
+            self.like_context();
+        }
+        if alt(&key, 'L') {
+            self.open_playlist(None);
+        }
+        if alt(&key, 'P') {
+            self.enter_playlists();
+        }
+        if alt(&key, 'o') || alt(&key, 't') {
+            self.mode = Mode::Queue;
+        }
+        if alt(&key, 'y') {
+            self.prompt = String::new();
+            self.prompt_kind = PromptKind::LoadYtPlaylist;
+            self.mode = Mode::Prompt;
+        }
+        if alt(&key, 'S') {
+            self.prompt = String::new();
+            self.prompt_kind = PromptKind::SaveQueue;
+            self.mode = Mode::Prompt;
+        }
+        if alt(&key, 'u') {
+            self.refresh_local();
+            self.mode = Mode::Local;
+        }
+        if alt(&key, 'e') {
+            self.toggle_eq().await?;
+        }
+        if alt(&key, 'x') {
+            self.clear_eq().await?;
+        }
+        if alt(&key, 'n') {
+            self.next();
+        }
+        if alt(&key, 'p') {
+            self.prev();
+        }
+        if alt(&key, 'r') {
+            self.cycle_repeat();
+        }
+        if alt(&key, 'z') {
+            self.toggle_shuffle();
+        }
         match key.code {
             KeyCode::Char('q') => anyhow::bail!("quit"),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -625,26 +698,6 @@ impl App {
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('s') | KeyCode::Char('/') => self.mode = Mode::Search,
-            KeyCode::Char('o') | KeyCode::Char('t') => self.mode = Mode::Queue,
-            KeyCode::Char('l') => self.like_context(),
-            KeyCode::Char('L') => self.open_playlist(None),
-            KeyCode::Char('P') => self.enter_playlists(),
-            KeyCode::Char('y') => {
-                self.prompt = String::new();
-                self.prompt_kind = PromptKind::LoadYtPlaylist;
-                self.mode = Mode::Prompt;
-            }
-            KeyCode::Char('S') => {
-                self.prompt = String::new();
-                self.prompt_kind = PromptKind::SaveQueue;
-                self.mode = Mode::Prompt;
-            }
-            KeyCode::Char('u') => {
-                self.refresh_local();
-                self.mode = Mode::Local;
-            }
-            KeyCode::Char('e') => self.toggle_eq().await?,
-            KeyCode::Char('x') => self.clear_eq().await?,
             KeyCode::Char(' ') => self.mpv.play_pause().await?,
             KeyCode::Left => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -672,18 +725,35 @@ impl App {
                 let vol = s.volume + 5.0;
                 self.mpv.set_volume(vol).await?;
             }
-            KeyCode::Char('n') => self.next(),
-            KeyCode::Char('p') => self.prev(),
-            KeyCode::Char('r') => self.cycle_repeat(),
-            KeyCode::Char('z') => self.toggle_shuffle(),
             _ => {}
         }
         Ok(())
     }
 
     fn handle_queue_key(&mut self, key: KeyEvent) -> Result<()> {
+        if alt(&key, 'l') {
+            self.like_context();
+        }
+        if alt(&key, 'L') {
+            self.open_playlist(None);
+        }
+        if alt(&key, 'P') {
+            self.enter_playlists();
+        }
+        if alt(&key, 'o') || alt(&key, 't') {
+            self.mode = Mode::NowPlaying;
+        }
+        if alt(&key, 'z') {
+            self.toggle_shuffle();
+        }
+        if alt(&key, 'r') {
+            self.cycle_repeat();
+        }
+        if alt(&key, 'd') {
+            self.remove_queue_item(self.cursor);
+        }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('t') => self.mode = Mode::NowPlaying,
+            KeyCode::Esc => self.mode = Mode::NowPlaying,
             KeyCode::Up | KeyCode::Char('k') => {
                 self.cursor = self.cursor.saturating_sub(1);
             }
@@ -691,12 +761,7 @@ impl App {
                 self.cursor = (self.cursor + 1).min(self.queue.len().saturating_sub(1));
             }
             KeyCode::Enter => self.play_queue_item(self.cursor),
-            KeyCode::Char('d') | KeyCode::Delete => self.remove_queue_item(self.cursor),
-            KeyCode::Char('l') => self.like_context(),
-            KeyCode::Char('L') => self.open_playlist(None),
-            KeyCode::Char('P') => self.enter_playlists(),
-            KeyCode::Char('z') => self.toggle_shuffle(),
-            KeyCode::Char('r') => self.cycle_repeat(),
+            KeyCode::Delete => self.remove_queue_item(self.cursor),
             _ => {}
         }
         Ok(())
@@ -743,15 +808,27 @@ impl App {
             KeyCode::Backspace => {
                 self.prompt.pop();
             }
-            KeyCode::Char(c) if !c.is_control() => self.prompt.push(c),
+            KeyCode::Char(c)
+                if !c.is_control() && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.prompt.push(c)
+            }
             _ => {}
         }
         Ok(())
     }
 
     fn handle_playlists_key(&mut self, key: KeyEvent) -> Result<()> {
+        if alt(&key, 'P') {
+            self.mode = Mode::NowPlaying;
+            return Ok(());
+        }
+        if alt(&key, 'L') {
+            self.open_playlist(None);
+            return Ok(());
+        }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('P') => self.mode = Mode::NowPlaying,
+            KeyCode::Esc => self.mode = Mode::NowPlaying,
             KeyCode::Up | KeyCode::Char('k') => {
                 self.playlist_cursor = self.playlist_cursor.saturating_sub(1);
             }
@@ -759,7 +836,6 @@ impl App {
                 self.playlist_cursor =
                     (self.playlist_cursor + 1).min(self.playlist_names.len().saturating_sub(1));
             }
-            KeyCode::Char('L') => self.open_playlist(None),
             KeyCode::Enter => {
                 if let Some(name) = self.playlist_names.get(self.playlist_cursor).cloned() {
                     self.open_playlist(Some(&name));
@@ -771,6 +847,16 @@ impl App {
     }
 
     fn handle_playlist_detail_key(&mut self, key: KeyEvent) -> Result<()> {
+        if alt(&key, 'l')
+            && let Some(t) = self.playlist_tracks.get(self.playlist_cursor).cloned()
+        {
+            self.toggle_like(&t);
+        }
+        if alt(&key, 'x') && self.active_playlist.is_some() {
+            self.delete_active_playlist();
+        } else if alt(&key, 'd') {
+            self.remove_from_playlist(self.playlist_cursor);
+        }
         match key.code {
             KeyCode::Esc => self.mode = Mode::Playlists,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -781,21 +867,24 @@ impl App {
                     (self.playlist_cursor + 1).min(self.playlist_tracks.len().saturating_sub(1));
             }
             KeyCode::Enter => self.play_playlist_item(self.playlist_cursor),
-            KeyCode::Char('l') => {
-                if let Some(t) = self.playlist_tracks.get(self.playlist_cursor).cloned() {
-                    self.toggle_like(&t);
-                }
-            }
-            KeyCode::Char('d') | KeyCode::Delete => self.remove_from_playlist(self.playlist_cursor),
-            KeyCode::Char('x') if self.active_playlist.is_some() => self.delete_active_playlist(),
+            KeyCode::Delete => self.remove_from_playlist(self.playlist_cursor),
             _ => {}
         }
         Ok(())
     }
 
     fn handle_local_key(&mut self, key: KeyEvent) -> Result<()> {
+        if alt(&key, 'l')
+            && let Some(t) = self.local_tracks.get(self.local_cursor).cloned()
+        {
+            self.toggle_like(&t);
+        }
+        if alt(&key, 'u') {
+            self.mode = Mode::NowPlaying;
+            return Ok(());
+        }
         match key.code {
-            KeyCode::Esc | KeyCode::Char('u') => self.mode = Mode::NowPlaying,
+            KeyCode::Esc => self.mode = Mode::NowPlaying,
             KeyCode::Up | KeyCode::Char('k') => {
                 self.local_cursor = self.local_cursor.saturating_sub(1);
             }
@@ -804,11 +893,6 @@ impl App {
                     (self.local_cursor + 1).min(self.local_tracks.len().saturating_sub(1));
             }
             KeyCode::Enter => self.play_local_item(self.local_cursor),
-            KeyCode::Char('l') => {
-                if let Some(t) = self.local_tracks.get(self.local_cursor).cloned() {
-                    self.toggle_like(&t);
-                }
-            }
             _ => {}
         }
         Ok(())
@@ -895,5 +979,28 @@ fn fast_rng() -> u32 {
 impl std::fmt::Debug for App {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("App").field("mode", &self.mode).finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::alt;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn k(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn alt_helper_requires_alt_modifier_and_matching_char() {
+        assert!(alt(&k(KeyCode::Char('l'), KeyModifiers::ALT), 'l'));
+        assert!(!alt(&k(KeyCode::Char('l'), KeyModifiers::empty()), 'l'));
+        assert!(!alt(&k(KeyCode::Char('r'), KeyModifiers::ALT), 'l'));
+        assert!(!alt(&k(KeyCode::Char('l'), KeyModifiers::CONTROL), 'l'));
+        assert!(alt(&k(KeyCode::Char('P'), KeyModifiers::ALT), 'P'));
+        assert!(alt(
+            &k(KeyCode::Char('R'), KeyModifiers::ALT.union(KeyModifiers::SHIFT)),
+            'R'
+        ));
     }
 }

@@ -9,6 +9,10 @@ use crate::tui::app::{Mode, PromptKind, RepeatMode, ViewData};
 
 const HIGHLIGHT: Color = Color::Rgb(40, 44, 52);
 
+fn footer<'a>(text: &'a str) -> Paragraph<'a> {
+    Paragraph::new(text).style(Style::default().fg(Color::DarkGray))
+}
+
 pub fn draw(frame: &mut Frame, data: &ViewData, mode: Mode) {
     match mode {
         Mode::Search => draw_search(frame, data),
@@ -86,8 +90,7 @@ fn draw_search(frame: &mut Frame, data: &ViewData) {
     frame.set_cursor_position((chunks[0].x + 2 + data.query.len() as u16, chunks[0].y + 1));
 
     frame.render_widget(
-        Paragraph::new("enter: play   l: like   L: liked   P: playlists   y: yt playlist   S: save queue   u: local files   e/x: eq   ?: help")
-            .style(Style::default().fg(Color::DarkGray)),
+        footer("type: query   enter: play   alt+l: like   esc: back   ctrl+c: quit"),
         chunks[1],
     );
 
@@ -124,10 +127,7 @@ fn draw_search(frame: &mut Frame, data: &ViewData) {
         );
     }
 
-    frame.render_widget(
-        Paragraph::new("lastwave").style(Style::default().fg(Color::DarkGray)),
-        chunks[3],
-    );
+    frame.render_widget(footer("lastwave — bare letters type"), chunks[3]);
 }
 
 fn draw_now_playing(frame: &mut Frame, data: &ViewData) {
@@ -212,12 +212,12 @@ fn draw_now_playing(frame: &mut Frame, data: &ViewData) {
         Span::styled("space pause  ", Style::default().fg(Color::Blue)),
         Span::styled("← → seek  ", Style::default().fg(Color::Blue)),
         Span::styled(", . vol  ", Style::default().fg(Color::Blue)),
-        Span::styled("n/p next prev  ", Style::default().fg(Color::Blue)),
-        Span::styled("l like  ", Style::default().fg(Color::Blue)),
+        Span::styled("alt+n/p next prev  ", Style::default().fg(Color::Blue)),
+        Span::styled("alt+l like  ", Style::default().fg(Color::Blue)),
+        Span::styled("alt+r repeat  ", Style::default().fg(Color::Blue)),
+        Span::styled("alt+z shuffle  ", Style::default().fg(Color::Blue)),
+        Span::styled("alt+e/alt+x eq  ", Style::default().fg(Color::Blue)),
         Span::styled("s search  ", Style::default().fg(Color::Blue)),
-        Span::styled("z shuffle  ", Style::default().fg(Color::Blue)),
-        Span::styled("r repeat  ", Style::default().fg(Color::Blue)),
-        Span::styled("e eq  ", Style::default().fg(Color::Blue)),
         Span::styled("q quit", Style::default().fg(Color::Blue)),
         Span::styled("  ", Style::default().fg(Color::DarkGray)),
         Span::styled(data.eq.clone(), Style::default().fg(Color::Cyan)),
@@ -308,8 +308,7 @@ fn draw_queue(frame: &mut Frame, data: &ViewData) {
     }
 
     frame.render_widget(
-        Paragraph::new("enter: play   d: remove   l: like   j/k: move   o/esc: back")
-            .style(Style::default().fg(Color::DarkGray)),
+        footer("enter: play   alt+l: like   alt+d: remove   alt+o/alt+t: back   j/k: move   esc: back"),
         chunks[2],
     );
 }
@@ -352,7 +351,7 @@ fn draw_playlists(frame: &mut Frame, data: &ViewData) {
         .split(frame.area());
 
     frame.render_widget(
-        Paragraph::new("Playlists — L opens Liked Songs")
+        Paragraph::new("Playlists — alt+L opens Liked Songs")
             .style(Style::default().fg(Color::Cyan)),
         chunks[0],
     );
@@ -387,8 +386,7 @@ fn draw_playlists(frame: &mut Frame, data: &ViewData) {
     );
 
     frame.render_widget(
-        Paragraph::new("enter: open   j/k: move   esc: back")
-            .style(Style::default().fg(Color::DarkGray)),
+        footer("enter: open   alt+L: liked   alt+P: back   j/k: move   esc: back"),
         chunks[2],
     );
 }
@@ -446,12 +444,12 @@ fn draw_playlist_detail(frame: &mut Frame, data: &ViewData) {
     }
 
     let hint = if data.active_playlist.is_some() {
-        "enter: play   d: remove   x: delete playlist   l: like   esc: back"
+        "enter: play   alt+l: like   alt+d: remove   alt+x: delete playlist   esc: back"
     } else {
-        "enter: play   d: unlike   l: like   esc: back"
+        "enter: play   alt+l: like   alt+d: unlike   esc: back"
     };
     frame.render_widget(
-        Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+        footer(hint),
         chunks[2],
     );
 }
@@ -524,8 +522,7 @@ fn draw_local(frame: &mut Frame, data: &ViewData) {
     }
 
     frame.render_widget(
-        Paragraph::new("enter: play   l: like   j/k: move   esc: back")
-            .style(Style::default().fg(Color::DarkGray)),
+        footer("enter: play   alt+l: like   j/k: move   esc: back"),
         chunks[2],
     );
 }
@@ -538,20 +535,21 @@ fn draw_help(frame: &mut Frame) {
         "   space            play / pause\n",
         "   ← / →            seek 10s (shift: 60s)\n",
         "   , / .            volume down / up\n",
-        "   n / p            next / previous\n",
         "   j / k            move down / up (lists)\n",
-        "   o / t            open queue\n",
-        "   l                like / unlike (heart)\n",
-        "   L                open Liked Songs\n",
-        "   P                open playlists\n",
-        "   y                load a YouTube Music playlist\n",
-        "   S                save current queue as playlist\n",
-        "   u                local files (FLAC/Opus/MP3)\n",
-        "   e                toggle EQ preset (deep bass)\n",
-        "   x                reset EQ to clean\n",
-        "   z                toggle shuffle\n",
-        "   r                cycle repeat\n",
+        "   alt+n / alt+p    next / previous\n",
+        "   alt+l            like / unlike (heart)\n",
+        "   alt+L            open Liked Songs\n",
+        "   alt+P            open playlists\n",
+        "   alt+o / alt+t    open queue\n",
+        "   alt+y            load a YouTube Music playlist\n",
+        "   alt+S            save current queue as playlist\n",
+        "   alt+u            local files (FLAC/Opus/MP3)\n",
+        "   alt+e            toggle EQ preset (deep bass)\n",
+        "   alt+x            reset EQ to clean\n",
+        "   alt+z            toggle shuffle\n",
+        "   alt+r            cycle repeat\n",
         "   q                quit\n\n",
+        "   bare letters type in search; alt+letter acts\n",
         "   press any key to close",
     );
     let area = centered(70, 27, frame.area());

@@ -140,6 +140,10 @@ eq = { preset = "Deep Bass", presets = [
 
 ## Controls
 
+> **One rule everywhere: bare letters type; `Alt+letter` acts.**
+> A persistent key-bind bar at the bottom of every screen shows the current
+> mode's bindings; `?` shows the full list.
+
 ### Now Playing
 
 | Key | Action |
@@ -148,19 +152,19 @@ eq = { preset = "Deep Bass", presets = [
 | `←` / `→` | Seek −10s / +10s |
 | `Shift+←` / `Shift+→` | Seek −60s / +60s |
 | `,` / `.` | Volume down / up (5) |
-| `n` / `p` | Next / previous track |
-| `r` | Cycle repeat mode |
-| `z` | Toggle shuffle |
-| `l` | Like / unlike current track |
-| `L` | Open the Liked playlist |
-| `P` | Browse playlists |
-| `y` | Load a YouTube Music playlist (URL or id) |
-| `S` | Save current queue as a playlist |
-| `u` | Local file library |
-| `e` | Toggle the EQ preset |
-| `x` | Force clean (no EQ) |
+| `Alt+n` / `Alt+p` | Next / previous track |
+| `Alt+r` | Cycle repeat mode |
+| `Alt+z` | Toggle shuffle |
+| `Alt+l` | Like / unlike current track |
+| `Alt+L` | Open the Liked playlist |
+| `Alt+P` | Browse playlists |
+| `Alt+y` | Load a YouTube Music playlist (URL or id) |
+| `Alt+S` | Save current queue as a playlist |
+| `Alt+u` | Local file library |
+| `Alt+e` | Toggle the EQ preset |
+| `Alt+x` | Force clean (no EQ) |
+| `Alt+o` / `Alt+t` | Open the queue |
 | `s` or `/` | Search |
-| `o` or `t` | Open the queue |
 | `?` | Help overlay |
 | `q` or `Ctrl+C` | Quit |
 
@@ -172,7 +176,7 @@ eq = { preset = "Deep Bass", presets = [
 | `Backspace` | Remove last character |
 | `↑` / `↓` | Select result |
 | `Enter` | Play selected result |
-| `l` | Like / unlike selected result |
+| `Alt+l` | Like / unlike selected result |
 | `Esc` | Back to Now Playing |
 
 ### Queue
@@ -181,10 +185,10 @@ eq = { preset = "Deep Bass", presets = [
 |---|---|
 | `↑` / `↓` or `k` / `j` | Move selection |
 | `Enter` | Play selected item |
-| `d` / `Delete` | Remove item |
-| `z` | Toggle shuffle |
-| `r` | Cycle repeat mode |
-| `Esc`, `o` or `t` | Back to Now Playing |
+| `Alt+d` / `Delete` | Remove item |
+| `Alt+z` | Toggle shuffle |
+| `Alt+r` | Cycle repeat mode |
+| `Alt+o` / `Alt+t` or `Esc` | Back to Now Playing |
 
 ### Playlists & Local
 
@@ -192,10 +196,10 @@ eq = { preset = "Deep Bass", presets = [
 |---|---|
 | `↑` / `↓` or `k` / `j` | Move selection |
 | `Enter` | Play selected playlist / track |
-| `l` | Like / unlike a track |
-| `d` / `Delete` | Remove from playlist (detail view) |
-| `x` | Delete the playlist entirely (detail view) |
-| `Esc` (`P`/`u` to re-enter) | Back to Now Playing |
+| `Alt+l` | Like / unlike a track |
+| `Alt+d` / `Delete` | Remove from playlist (detail view) |
+| `Alt+x` | Delete the playlist entirely (detail view) |
+| `Esc` (`Alt+P`/`Alt+u` to re-enter) | Back to Now Playing |
 
 ## How streaming works
 
