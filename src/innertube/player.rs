@@ -1,6 +1,8 @@
 use reqwest::Client;
 use serde_json::{Value, json};
 
+use crate::config::Codec;
+
 use super::{config::InnertubeConfig, is_login_required};
 
 /// A resolved, directly playable audio stream.
@@ -9,6 +11,43 @@ pub struct StreamFormat {
     pub url: String,
     pub itag: Option<u32>,
     pub bitrate: Option<u32>,
+    pub mime: Option<String>,
+}
+
+impl StreamFormat {
+    /// Short codec label for the UI: OPUS / AAC / MP3 / VORBIS / AUDIO.
+    pub fn codec(&self) -> &'static str {
+        match self.mime.as_deref().unwrap_or("") {
+            m if m.starts_with("audio/webm") || m.starts_with("audio/ogg") => "OPUS",
+            m if m.starts_with("audio/mp4") || m.starts_with("audio/m4a") => "AAC",
+            m if m.starts_with("audio/mpeg") => "MP3",
+            m if m.contains("vorbis") => "VORBIS",
+            m if m.contains("opus") => "OPUS",
+            m if m.contains("aac") => "AAC",
+            _ => "AUDIO",
+        }
+    }
+
+    /// e.g. `OPUS 160 kbps` or `AAC 128 kbps`.
+    pub fn display(&self) -> String {
+        let codec = self.codec();
+        let br = self
+            .bitrate
+            .map(|b| format!(" {} kbps", (b as f64 / 1000.0).round() as u32))
+            .unwrap_or_default();
+        format!("{codec}{br}")
+    }
+}
+
+/// codec tier, lower is better (OPUS < AAC < VORBIS < MP3 < other).
+fn codec_tier(mime: Option<&str>) -> u8 {
+    match mime.unwrap_or("") {
+        m if m.starts_with("audio/webm") || m.starts_with("audio/ogg") || m.contains("opus") => 0,
+        m if m.starts_with("audio/mp4") || m.starts_with("audio/m4a") || m.contains("aac") => 1,
+        m if m.contains("vorbis") => 2,
+        m if m.starts_with("audio/mpeg") => 3,
+        _ => 4,
+    }
 }
 
 /// A YouTube innerTube player client we are willing to resolve streams with.
@@ -63,8 +102,8 @@ const CLIENTS: [ClientDef; 3] = [
     },
 ];
 
-/// Preferred audio itags (highest quality first). VISIONOS serves opus (251)
-/// in addition to the m4a family that the mobile clients expose.
+/// Preferred audio itags (highest quality first) as a tiebreaker after codec
+/// family. VISIONOS serves opus (251) in addition to the m4a family (140/141).
 const PREFERRED_ITAGS: [u32; 4] = [251, 140, 141, 139];
 
 /// Resolve a playable, download-verified stream URL for a video id.
@@ -84,6 +123,7 @@ pub async fn resolve_stream(
     client: &Client,
     cfg: &mut InnertubeConfig,
     video_id: &str,
+    preferred_codec: Codec,
 ) -> anyhow::Result<StreamFormat> {
     for def in CLIENTS {
         for attempt in 0..2 {
@@ -95,7 +135,7 @@ pub async fn resolve_stream(
                 }
                 break;
             }
-            if let Some(fmt) = best_audio(&value) {
+            if let Some(fmt) = best_audio(&value, preferred_codec) {
                 if verify_url(client, &fmt.url).await {
                     return Ok(fmt);
                 }
@@ -176,7 +216,7 @@ async fn verify_url(client: &Client, url: &str) -> bool {
 
 /// Pick the best audio-only format from an adaptiveFormats list.
 /// Formats behind a `signatureCipher` are ignored for now.
-fn best_audio(response: &Value) -> Option<StreamFormat> {
+fn best_audio(response: &Value, preferred: Codec) -> Option<StreamFormat> {
     let formats = response
         .pointer("/streamingData/adaptiveFormats")
         .and_then(Value::as_array)?;
@@ -187,6 +227,15 @@ fn best_audio(response: &Value) -> Option<StreamFormat> {
         if !mime.starts_with("audio/") {
             continue;
         }
+        let codec = codec_label(mime);
+        let want = match preferred {
+            Codec::Opus => codec == "OPUS",
+            Codec::Aac => codec == "AAC",
+            Codec::Best => true,
+        };
+        if !want {
+            continue;
+        }
         let url = match f.get("url").and_then(Value::as_str) {
             Some(u) if u.starts_with("http") => u.to_string(),
             _ => continue,
@@ -195,6 +244,7 @@ fn best_audio(response: &Value) -> Option<StreamFormat> {
             url,
             itag: f.get("itag").and_then(Value::as_u64).map(|v| v as u32),
             bitrate: f.get("bitrate").and_then(Value::as_u64).map(|v| v as u32),
+            mime: Some(mime.to_string()),
         });
     }
     if usable.is_empty() {
@@ -202,16 +252,30 @@ fn best_audio(response: &Value) -> Option<StreamFormat> {
     }
 
     usable.sort_by_key(|f| {
+        let tier = codec_tier(f.mime.as_deref());
         let pref = f
             .itag
             .and_then(|itag| PREFERRED_ITAGS.iter().position(|&x| x == itag))
             .unwrap_or(4);
-        // Prefer lower index (higher itag priority), then higher bitrate.
+        // Prefer low codec tier, then preferred itag, then higher bitrate.
         let anti_bitrate = i32::MAX - f.bitrate.unwrap_or(0) as i32;
-        (pref, anti_bitrate)
+        (tier, pref, anti_bitrate)
     });
 
     usable.into_iter().next()
+}
+
+/// Human codec name for a mime type like `audio/webm; codecs="opus"`.
+fn codec_label(mime: &str) -> &'static str {
+    match mime {
+        m if m.starts_with("audio/webm") || m.starts_with("audio/ogg") || m.contains("opus") => {
+            "OPUS"
+        }
+        m if m.starts_with("audio/mp4") || m.starts_with("audio/m4a") || m.contains("aac") => "AAC",
+        m if m.contains("vorbis") => "VORBIS",
+        m if m.starts_with("audio/mpeg") => "MP3",
+        _ => "AUDIO",
+    }
 }
 
 #[cfg(test)]
@@ -260,15 +324,30 @@ mod tests {
 
     #[test]
     fn picks_preferred_audio() {
-        let fmt = best_audio(&sample_formats(true)).unwrap();
-        // itag 251 is preferred over 140.
+        let fmt = best_audio(&sample_formats(true), Codec::Best).unwrap();
+        // itag 251 (opus) is preferred over 140 (aac).
         assert_eq!(fmt.itag, Some(251));
         assert_eq!(fmt.url, "https://rr.example/audio251");
+        assert_eq!(fmt.codec(), "OPUS");
+    }
+
+    #[test]
+    fn honors_codec_preference() {
+        let opus = best_audio(&sample_formats(true), Codec::Opus).unwrap();
+        assert_eq!(opus.itag, Some(251));
+        let aac = best_audio(&sample_formats(true), Codec::Aac).unwrap();
+        assert_eq!(aac.itag, Some(140));
     }
 
     #[test]
     fn returns_none_when_only_ciphered() {
-        assert!(best_audio(&sample_formats(false)).is_none());
-        assert!(best_audio(&json_of(r#"{"streamingData":{}}"#)).is_none());
+        assert!(best_audio(&sample_formats(false), Codec::Best).is_none());
+        assert!(best_audio(&json_of(r#"{"streamingData":{}}"#), Codec::Best).is_none());
+    }
+
+    #[test]
+    fn display_includes_codec() {
+        let fmt = best_audio(&sample_formats(true), Codec::Best).unwrap();
+        assert!(fmt.display().starts_with("OPUS"));
     }
 }

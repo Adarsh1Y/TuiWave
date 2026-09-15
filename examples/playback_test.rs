@@ -30,10 +30,11 @@ async fn main() -> anyhow::Result<()> {
         lastwave::innertube::player::StreamFormat {
             itag: None,
             bitrate: None,
+            mime: None,
             url: u,
         }
     } else {
-        innertube::resolve_stream(&client, &mut cfg, &first.video_id).await?
+        innertube::resolve_stream(&client, &mut cfg, &first.video_id, Default::default()).await?
     };
     println!("stream itag={:?} bitrate={:?}", stream.itag, stream.bitrate);
 

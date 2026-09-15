@@ -33,6 +33,9 @@ fn main() -> Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let (mpv, mpv_events) = mpv::Mpv::spawn(&cfg).await?;
+        if let Some(chain) = cfg.active_eq_chain().filter(|c| !c.is_empty()) {
+            let _ = mpv.set_af(&chain).await;
+        }
         tui::run(&cfg, mpv, mpv_events).await
     })
 }

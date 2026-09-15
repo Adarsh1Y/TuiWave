@@ -1,6 +1,7 @@
 pub mod config;
 pub mod nsig;
 pub mod player;
+pub mod playlist;
 pub mod search;
 pub mod ytdl;
 
@@ -11,6 +12,8 @@ use reqwest::Client;
 use serde_json::Value;
 
 use config::{InnertubeConfig, context};
+
+use crate::config::Codec;
 
 pub const SEARCH_FILTER_SONGS: &str = "EgWKAQIIAWoKEAoQCRADEAA%3D";
 const MUSIC_BASE: &str = "https://music.youtube.com/youtubei/v1";
@@ -24,7 +27,7 @@ pub fn http_client() -> Client {
 }
 
 /// Send a POST to a youtubei endpoint and return the raw JSON body.
-async fn post_json(
+pub async fn post_json(
     client: &Client,
     cfg: &InnertubeConfig,
     endpoint: &str,
@@ -64,18 +67,6 @@ fn is_login_required(value: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Safe text extraction: concatenates `.text` runs of a renderer field.
-fn run_text(node: &Value) -> Option<String> {
-    let runs = node.pointer("/runs")?.as_array()?;
-    let mut out = String::new();
-    for run in runs {
-        if let Some(text) = run.get("text").and_then(Value::as_str) {
-            out.push_str(text);
-        }
-    }
-    if out.is_empty() { None } else { Some(out) }
-}
-
 pub use player::StreamFormat;
 
 /// Resolve a direct, playable stream URL for a track. Tries the VISIONOS
@@ -85,8 +76,9 @@ pub async fn resolve_stream(
     client: &Client,
     cfg: &mut InnertubeConfig,
     video_id: &str,
+    preferred_codec: Codec,
 ) -> anyhow::Result<StreamFormat> {
-    player::resolve_stream(client, cfg, video_id)
+    player::resolve_stream(client, cfg, video_id, preferred_codec)
         .await
         .with_context(|| format!("failed to resolve stream for {video_id}"))
 }
@@ -114,11 +106,5 @@ mod tests {
         assert!(is_login_required(&bad));
         let ok = json!({"playabilityStatus": {"status": "OK"}});
         assert!(!is_login_required(&ok));
-    }
-
-    #[test]
-    fn run_text_extracts_first_run() {
-        let node = json!({"runs": [{"text": "Hello"}, {"text": "World"}]});
-        assert_eq!(run_text(&node).as_deref(), Some("HelloWorld"));
     }
 }

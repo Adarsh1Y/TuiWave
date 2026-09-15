@@ -31,7 +31,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(first) = tracks.first() {
         let mut cfg = cfg;
         let client = innertube::http_client();
-        match innertube::resolve_stream(&client, &mut cfg, &first.video_id).await {
+        match innertube::resolve_stream(&client, &mut cfg, &first.video_id, Default::default())
+            .await
+        {
             Ok(fmt) => {
                 println!(
                     "stream: itag={:?} bitrate={:?} url={}",

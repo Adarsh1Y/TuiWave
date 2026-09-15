@@ -5,7 +5,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 
 use crate::art;
-use crate::tui::app::{Mode, RepeatMode, ViewData};
+use crate::tui::app::{Mode, PromptKind, RepeatMode, ViewData};
+
+const HIGHLIGHT: Color = Color::Rgb(40, 44, 52);
 
 pub fn draw(frame: &mut Frame, data: &ViewData, mode: Mode) {
     match mode {
@@ -13,10 +15,51 @@ pub fn draw(frame: &mut Frame, data: &ViewData, mode: Mode) {
         Mode::NowPlaying => draw_now_playing(frame, data),
         Mode::Queue => draw_queue(frame, data),
         Mode::Help => draw_help(frame),
+        Mode::Prompt => draw_prompt(frame, data),
+        Mode::Playlists => draw_playlists(frame, data),
+        Mode::PlaylistDetail => draw_playlist_detail(frame, data),
+        Mode::Local => draw_local(frame, data),
     }
     if let Some(toast) = &data.toast {
         draw_toast(frame, toast);
     }
+}
+
+fn heart(track_liked: bool) -> &'static str {
+    if track_liked {
+        "♥ "
+    } else {
+        "  "
+    }
+}
+
+fn track_line<'a>(t: &'a crate::model::Track, liked: bool, show_like: bool) -> Line<'a> {
+    let mut spans = Vec::new();
+    if show_like {
+        spans.push(Span::styled(
+            heart(liked),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.push(Span::styled(
+        t.title.clone(),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        format!("  —  {}", t.artist),
+        Style::default().fg(Color::DarkGray),
+    ));
+    if let Some(album) = &t.album {
+        spans.push(Span::styled(
+            format!("  [{album}]"),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+    spans.push(Span::styled(
+        format!("  {}", format_duration(t.duration)),
+        Style::default().fg(Color::Gray),
+    ));
+    Line::from(spans)
 }
 
 fn draw_search(frame: &mut Frame, data: &ViewData) {
@@ -43,14 +86,14 @@ fn draw_search(frame: &mut Frame, data: &ViewData) {
     frame.set_cursor_position((chunks[0].x + 2 + data.query.len() as u16, chunks[0].y + 1));
 
     frame.render_widget(
-        Paragraph::new("Enter: play   a: add to queue   z: shuffle   ?: help")
+        Paragraph::new("enter: play   l: like   L: liked   P: playlists   y: yt playlist   S: save queue   u: local files   e/x: eq   ?: help")
             .style(Style::default().fg(Color::DarkGray)),
         chunks[1],
     );
 
     if data.results.is_empty() {
         frame.render_widget(
-            Paragraph::new("type to search — matches appear here")
+            Paragraph::new("type to search — songs appear here")
                 .style(Style::default().fg(Color::DarkGray))
                 .alignment(Alignment::Center),
             chunks[2],
@@ -60,26 +103,17 @@ fn draw_search(frame: &mut Frame, data: &ViewData) {
             .results
             .iter()
             .map(|t| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        t.title.clone(),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  —  {}", t.artist),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        format!("  {}", format_duration(t.duration)),
-                        Style::default().fg(Color::Gray),
-                    ),
-                ]))
+                ListItem::new(track_line(
+                    t,
+                    data.liked_keys.contains(&t.key()),
+                    true,
+                ))
             })
             .collect();
 
         let list = List::new(items)
             .block(Block::default().borders(Borders::ALL).title(" Results "))
-            .highlight_style(Style::default().bg(Color::Rgb(40, 44, 52)))
+            .highlight_style(Style::default().bg(HIGHLIGHT))
             .highlight_symbol("▶ ");
         frame.render_stateful_widget(
             list,
@@ -131,14 +165,29 @@ fn draw_now_playing(frame: &mut Frame, data: &ViewData) {
         ])
         .split(inner[0]);
 
+    let liked = data.liked_keys.contains(&track.key());
+    let mut title_spans = vec![Span::styled(
+        "◉ ",
+        Style::default().fg(Color::Green),
+    )];
+    if liked {
+        title_spans.push(Span::styled(
+            "♥ ",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    title_spans.push(Span::styled(
+        track.title.clone(),
+        Style::default().bold().fg(Color::White),
+    ));
+    if let Some(codec) = &data.current_codec {
+        title_spans.push(Span::styled(
+            format!("   [{codec}]"),
+            Style::default().fg(Color::Green),
+        ));
+    }
     let media = vec![
-        Line::from(vec![
-            Span::styled("◉ ", Style::default().fg(Color::Green)),
-            Span::styled(
-                track.title.clone(),
-                Style::default().bold().fg(Color::White),
-            ),
-        ]),
+        Line::from(title_spans),
         Line::from(vec![
             Span::styled(track.artist.clone(), Style::default().fg(Color::Cyan)),
             Span::styled(" · ", Style::default().fg(Color::DarkGray)),
@@ -164,10 +213,14 @@ fn draw_now_playing(frame: &mut Frame, data: &ViewData) {
         Span::styled("← → seek  ", Style::default().fg(Color::Blue)),
         Span::styled(", . vol  ", Style::default().fg(Color::Blue)),
         Span::styled("n/p next prev  ", Style::default().fg(Color::Blue)),
+        Span::styled("l like  ", Style::default().fg(Color::Blue)),
         Span::styled("s search  ", Style::default().fg(Color::Blue)),
         Span::styled("z shuffle  ", Style::default().fg(Color::Blue)),
         Span::styled("r repeat  ", Style::default().fg(Color::Blue)),
+        Span::styled("e eq  ", Style::default().fg(Color::Blue)),
         Span::styled("q quit", Style::default().fg(Color::Blue)),
+        Span::styled("  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(data.eq.clone(), Style::default().fg(Color::Cyan)),
     ];
     line.push(Span::raw(if data.shuffle { "  🔀" } else { "  ·" }));
     line.push(Span::raw(match data.repeat {
@@ -209,8 +262,13 @@ fn draw_queue(frame: &mut Frame, data: &ViewData) {
         .map(|t| {
             let is_current = data.current.as_ref().map(|c| &c.video_id) == Some(&t.video_id);
             let prefix = if is_current { "▶" } else { " " };
+            let liked = data.liked_keys.contains(&t.key());
             ListItem::new(Line::from(vec![
                 Span::raw(prefix),
+                Span::styled(
+                    heart(liked),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(
                     t.title.clone(),
                     Style::default().add_modifier(if is_current {
@@ -242,8 +300,7 @@ fn draw_queue(frame: &mut Frame, data: &ViewData) {
         frame.render_stateful_widget(
             List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(" Tracks "))
-                .highlight_style(Style::default().bg(Color::Rgb(40, 44, 52)))
-                .highlight_symbol(""),
+                .highlight_style(Style::default().bg(HIGHLIGHT)),
             chunks[1],
             &mut ratatui::widgets::ListState::default()
                 .with_selected(Some(data.cursor.min(data.queue.len().saturating_sub(1)))),
@@ -251,7 +308,223 @@ fn draw_queue(frame: &mut Frame, data: &ViewData) {
     }
 
     frame.render_widget(
-        Paragraph::new("enter: play   d: remove   j/k: move   o/esc: back")
+        Paragraph::new("enter: play   d: remove   l: like   j/k: move   o/esc: back")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn draw_prompt(frame: &mut Frame, data: &ViewData) {
+    let label = match data.prompt_kind {
+        PromptKind::SaveQueue => "Save queue as playlist",
+        PromptKind::LoadYtPlaylist => "Paste YouTube Music playlist URL or id",
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    frame.render_widget(
+        Paragraph::new(data.prompt.as_str())
+            .block(Block::default().borders(Borders::ALL).title(label)),
+        chunks[0],
+    );
+    frame.set_cursor_position((chunks[0].x + 1 + data.prompt.len() as u16, chunks[0].y + 1));
+    frame.render_widget(
+        Paragraph::new("enter: confirm   esc: cancel")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn draw_playlists(frame: &mut Frame, data: &ViewData) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    frame.render_widget(
+        Paragraph::new("Playlists — L opens Liked Songs")
+            .style(Style::default().fg(Color::Cyan)),
+        chunks[0],
+    );
+
+    let mut items = vec![ListItem::new(Line::from(vec![
+        Span::styled("♥ ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("Liked Songs ({})", data.liked_keys.len()),
+            Style::default().bold(),
+        ),
+    ]))];
+    for name in &data.playlist_names {
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("♪ ", Style::default().fg(Color::Green)),
+            Span::styled(name.clone(), Style::default()),
+        ])));
+    }
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(" Playlists "))
+        .highlight_style(Style::default().bg(HIGHLIGHT))
+        .highlight_symbol("▶ ");
+    let selected = if data.playlist_cursor == 0 && data.playlist_names.is_empty() {
+        0
+    } else {
+        data.playlist_cursor.min(data.playlist_names.len())
+    };
+    frame.render_stateful_widget(
+        list,
+        chunks[1],
+        &mut ratatui::widgets::ListState::default().with_selected(Some(selected)),
+    );
+
+    frame.render_widget(
+        Paragraph::new("enter: open   j/k: move   esc: back")
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn draw_playlist_detail(frame: &mut Frame, data: &ViewData) {
+    let title = match &data.active_playlist {
+        Some(name) => format!(" Playlist: {name} "),
+        None => " Liked Songs ".to_string(),
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    frame.render_widget(
+        Paragraph::new(format!("{} tracks", data.playlist_tracks.len()))
+            .block(Block::default().borders(Borders::ALL).title(title)),
+        chunks[0],
+    );
+
+    let items: Vec<ListItem> = data
+        .playlist_tracks
+        .iter()
+        .map(|t| {
+            ListItem::new(track_line(
+                t,
+                data.liked_keys.contains(&t.key()),
+                true,
+            ))
+        })
+        .collect();
+
+    if data.playlist_tracks.is_empty() {
+        frame.render_widget(
+            Paragraph::new("empty")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center),
+            chunks[1],
+        );
+    } else {
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(" Tracks "))
+                .highlight_style(Style::default().bg(HIGHLIGHT))
+                .highlight_symbol("▶ "),
+            chunks[1],
+            &mut ratatui::widgets::ListState::default().with_selected(Some(
+                data.playlist_cursor.min(data.playlist_tracks.len().saturating_sub(1)),
+            )),
+        );
+    }
+
+    let hint = if data.active_playlist.is_some() {
+        "enter: play   d: remove   x: delete playlist   l: like   esc: back"
+    } else {
+        "enter: play   d: unlike   l: like   esc: back"
+    };
+    frame.render_widget(
+        Paragraph::new(hint).style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
+fn draw_local(frame: &mut Frame, data: &ViewData) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    frame.render_widget(
+        Paragraph::new(format!("{} local files", data.local_tracks.len()))
+            .block(Block::default().borders(Borders::ALL).title(" Local Files (FLAC/Opus/MP3) ")),
+        chunks[0],
+    );
+
+    let items: Vec<ListItem> = data
+        .local_tracks
+        .iter()
+        .map(|t| {
+            let ext = t
+                .source_path_extension()
+                .map(|e| e.to_uppercase())
+                .unwrap_or_default();
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    heart(data.liked_keys.contains(&t.key())),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(t.title.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("  [{}]", ext),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("  {}", t.album.clone().unwrap_or_default()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]))
+        })
+        .collect();
+
+    if data.local_tracks.is_empty() {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "no audio files found — set local_dirs in {}",
+                crate::config::Config::path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ))
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center),
+            chunks[1],
+        );
+    } else {
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(" Files "))
+                .highlight_style(Style::default().bg(HIGHLIGHT))
+                .highlight_symbol("▶ "),
+            chunks[1],
+            &mut ratatui::widgets::ListState::default().with_selected(Some(
+                data.local_cursor.min(data.local_tracks.len().saturating_sub(1)),
+            )),
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new("enter: play   l: like   j/k: move   esc: back")
             .style(Style::default().fg(Color::DarkGray)),
         chunks[2],
     );
@@ -262,19 +535,26 @@ fn draw_help(frame: &mut Frame) {
         " LastWave — bindings\n\n",
         "   s / /            search\n",
         "   enter            play selection\n",
-        "   a                add selection to queue\n",
         "   space            play / pause\n",
         "   ← / →            seek 10s (shift: 60s)\n",
         "   , / .            volume down / up\n",
         "   n / p            next / previous\n",
         "   j / k            move down / up (lists)\n",
         "   o / t            open queue\n",
+        "   l                like / unlike (heart)\n",
+        "   L                open Liked Songs\n",
+        "   P                open playlists\n",
+        "   y                load a YouTube Music playlist\n",
+        "   S                save current queue as playlist\n",
+        "   u                local files (FLAC/Opus/MP3)\n",
+        "   e                toggle EQ preset (deep bass)\n",
+        "   x                reset EQ to clean\n",
         "   z                toggle shuffle\n",
         "   r                cycle repeat\n",
         "   q                quit\n\n",
         "   press any key to close",
     );
-    let area = centered(70, 20, frame.area());
+    let area = centered(70, 27, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(text)

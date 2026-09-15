@@ -56,7 +56,7 @@ pub async fn run(
             };
             terminal.draw(|f| view::draw(f, &snapshot, app_state.mode))?;
 
-            if app_state.mode == app::Mode::Search {
+            if app_state.mode == app::Mode::Search || app_state.mode == app::Mode::Prompt {
                 terminal.show_cursor()?;
             } else {
                 terminal.hide_cursor()?;

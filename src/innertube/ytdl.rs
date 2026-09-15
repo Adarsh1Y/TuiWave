@@ -46,5 +46,6 @@ pub async fn resolve(ytdl_path: &str, video_id: &str) -> anyhow::Result<StreamFo
         url,
         itag: None,
         bitrate: None,
+        mime: None,
     })
 }

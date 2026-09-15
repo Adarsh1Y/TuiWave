@@ -72,7 +72,7 @@ impl Mpv {
         drop(child);
 
         let stream = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(15),
             connect_retry(&socket).map_err(|e| e.to_string()),
         )
         .await
@@ -155,6 +155,43 @@ impl Mpv {
         Ok(())
     }
 
+    /// Apply an audio filter chain to mpv (`af` property). An empty chain
+    /// resets to clean/unfiltered playback.
+    pub async fn set_af(&self, chain: &str) -> anyhow::Result<()> {
+        self.command_raw(json!(["set_property", "af", chain])).await?;
+        Ok(())
+    }
+
+    /// Read the currently active audio filter chain.
+    pub async fn get_af(&self) -> anyhow::Result<String> {
+        fn render(item: &Value) -> Option<String> {
+            match item {
+                Value::String(s) => Some(s.clone()),
+                Value::Object(map) => {
+                    let name = map.get("name").and_then(Value::as_str)?;
+                    let mut out = name.to_string();
+                    if let Some(params) = map.get("params").and_then(Value::as_object) {
+                        for (k, v) in params {
+                            out.push_str(&format!(",{}={}", k, v.as_str()?));
+                        }
+                    }
+                    Some(out)
+                }
+                _ => None,
+            }
+        }
+        let v = self.command_raw(json!(["get_property", "af"])).await?;
+        Ok(match v {
+            Value::String(s) => s,
+            Value::Array(items) => items
+                .iter()
+                .filter_map(render)
+                .collect::<Vec<_>>()
+                .join(","),
+            other => other.to_string(),
+        })
+    }
+
     pub async fn shutdown(&self) {
         let _ = self.command_raw(json!(["quit", 0])).await;
     }
@@ -207,7 +244,13 @@ async fn connect_retry(socket: &PathBuf) -> anyhow::Result<UnixStream> {
     loop {
         match UnixStream::connect(socket).await {
             Ok(s) => return Ok(s),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // The socket file may briefly exist while mpv is still accepting.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(e) => return Err(e.into()),

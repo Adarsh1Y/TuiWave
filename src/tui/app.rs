@@ -8,8 +8,11 @@ use tokio::sync::mpsc;
 use crate::art::Art;
 use crate::config::Config;
 use crate::innertube;
-use crate::model::Track;
+use crate::innertube::StreamFormat;
+use crate::library;
+use crate::model::{Track, TrackSource};
 use crate::mpv::{Mpv, MpvEvent};
+use crate::playlists;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -17,6 +20,16 @@ pub enum Mode {
     NowPlaying,
     Queue,
     Help,
+    Prompt,
+    Playlists,
+    PlaylistDetail,
+    Local,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptKind {
+    SaveQueue,
+    LoadYtPlaylist,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +40,7 @@ pub enum RepeatMode {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum AppEvent {
     SearchResults {
         seq: u64,
@@ -34,7 +48,10 @@ pub enum AppEvent {
     },
     StreamResolved {
         track: Track,
-        result: Result<innertube::StreamFormat, String>,
+        result: Result<StreamFormat, String>,
+    },
+    YtPlaylistLoaded {
+        result: Result<(String, Vec<Track>), String>,
     },
     Art {
         track_video_id: String,
@@ -53,16 +70,29 @@ pub struct App {
     pub cursor: usize,
     pub current: Option<Track>,
     pub current_art: Option<Art>,
+    pub current_codec: Option<String>,
     pub shuffle: bool,
     pub repeat: RepeatMode,
     pub toast: Option<(String, Instant)>,
     pub mpv: Mpv,
     pub events: mpsc::UnboundedSender<AppEvent>,
     search_seq: u64,
+
+    pub liked: Vec<Track>,
+    pub playlist_names: Vec<String>,
+    pub playlist_cursor: usize,
+    pub active_playlist: Option<String>,
+    pub playlist_tracks: Vec<Track>,
+    pub local_tracks: Vec<Track>,
+    pub local_cursor: usize,
+    pub prompt: String,
+    pub prompt_kind: PromptKind,
+    retry_pending: bool,
 }
 
 impl App {
     pub fn new(cfg: Config, mpv: Mpv, events: mpsc::UnboundedSender<AppEvent>) -> Self {
+        let liked = playlists::load_liked().unwrap_or_default();
         Self {
             cfg,
             mode: Mode::Search,
@@ -73,17 +103,75 @@ impl App {
             cursor: 0,
             current: None,
             current_art: None,
+            current_codec: None,
             shuffle: false,
             repeat: RepeatMode::Off,
             toast: None,
             mpv,
             events,
             search_seq: 0,
+            liked,
+            playlist_names: playlists::list_playlists().unwrap_or_default(),
+            playlist_cursor: 0,
+            active_playlist: None,
+            playlist_tracks: Vec::new(),
+            local_tracks: Vec::new(),
+            local_cursor: 0,
+            prompt: String::new(),
+            prompt_kind: PromptKind::SaveQueue,
+            retry_pending: false,
         }
     }
 
     pub fn show_toast(&mut self, message: impl Into<String>) {
         self.toast = Some((message.into(), Instant::now()));
+    }
+
+    pub fn is_liked(&self, track: &Track) -> bool {
+        self.liked.iter().any(|t| t.key() == track.key())
+    }
+
+    pub fn toggle_like(&mut self, track: &Track) {
+        if let Some(pos) = self.liked.iter().position(|t| t.key() == track.key()) {
+            self.liked.remove(pos);
+            self.show_toast("unliked");
+        } else {
+            self.liked.push(track.clone());
+            self.show_toast("liked ♥");
+        }
+        let _ = playlists::save_liked(&self.liked);
+    }
+
+    /// Like the track most relevant to the current context.
+    pub fn like_context(&mut self) {
+        match self.mode {
+            Mode::Search => {
+                if let Some(t) = self.results.get(self.selected).cloned() {
+                    self.toggle_like(&t);
+                }
+            }
+            Mode::Queue => {
+                if let Some(t) = self.queue.get(self.cursor).cloned() {
+                    self.toggle_like(&t);
+                }
+            }
+            Mode::PlaylistDetail => {
+                if let Some(t) = self.playlist_tracks.get(self.playlist_cursor).cloned() {
+                    self.toggle_like(&t);
+                }
+            }
+            Mode::Local => {
+                if let Some(t) = self.local_tracks.get(self.local_cursor).cloned() {
+                    self.toggle_like(&t);
+                }
+            }
+            Mode::NowPlaying => {
+                if let Some(t) = self.current.clone() {
+                    self.toggle_like(&t);
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn handle_event(&mut self, event: AppEvent) {
@@ -111,6 +199,7 @@ impl App {
                 }
                 match result {
                     Ok(stream) => {
+                        self.current_codec = Some(stream.display());
                         let title = format!("{} - {}", track.artist, track.title);
                         let url = stream.url.clone();
                         let mpv = self.mpv.clone();
@@ -120,8 +209,26 @@ impl App {
                         self.fetch_art_async(&track);
                     }
                     Err(e) => {
+                        self.retry_pending = false;
                         self.show_toast(format!("playback failed: {e}"));
                     }
+                }
+            }
+            AppEvent::YtPlaylistLoaded { result } => {
+                match result {
+                    Ok((title, tracks)) => {
+                        if tracks.is_empty() {
+                            self.show_toast("playlist is empty");
+                            return;
+                        }
+                        self.queue.clear();
+                        self.queue.extend(tracks);
+                        self.cursor = 0;
+                        self.mode = Mode::NowPlaying;
+                        self.play_current();
+                        self.show_toast(format!("{title} — {} tracks", self.queue.len()));
+                    }
+                    Err(e) => self.show_toast(format!("playlist failed: {e}")),
                 }
             }
             AppEvent::Art {
@@ -138,8 +245,23 @@ impl App {
                 }
             }
             AppEvent::Mpv(MpvEvent::EndFile { reason }) => {
-                if reason == "eof" || reason == "end-of-file" {
-                    self.on_track_ended();
+                match reason.as_str() {
+                    "eof" | "end-of-file" => {
+                        self.retry_pending = false;
+                        self.on_track_ended();
+                    }
+                    "error" => {
+                        // A stream died mid-song. Re-resolve once with a fresh
+                        // config; if the retry also fails, move to the next.
+                        if !self.retry_pending {
+                            self.retry_pending = true;
+                            self.play_current();
+                        } else {
+                            self.retry_pending = false;
+                            self.next();
+                        }
+                    }
+                    _ => {}
                 }
             }
             AppEvent::Mpv(MpvEvent::FileLoaded) | AppEvent::Mpv(MpvEvent::StateChanged) => {}
@@ -191,12 +313,26 @@ impl App {
         };
         self.current = Some(track.clone());
         self.current_art = None;
+        self.current_codec = None;
+
+        // Local files play directly through mpv — no stream resolution.
+        if let TrackSource::LocalFile(path) = &track.source {
+            let title = format!("{} - {}", track.artist, track.title);
+            let mpv = self.mpv.clone();
+            let path = path.clone();
+            tokio::spawn(async move {
+                let _ = mpv.load(&path.to_string_lossy(), &title, false).await;
+            });
+            return;
+        }
+
         let tx = self.events.clone();
         let id = track.video_id.clone();
+        let codec = self.cfg.codec;
         tokio::spawn(async move {
             let mut cfg = innertube::config::scrape().await;
             let client = innertube::http_client();
-            let result = innertube::resolve_stream(&client, &mut cfg, &id).await;
+            let result = innertube::resolve_stream(&client, &mut cfg, &id, codec).await;
             let _ = tx.send(AppEvent::StreamResolved {
                 track,
                 result: result.map_err(|e| e.to_string()),
@@ -277,6 +413,125 @@ impl App {
         self.show_toast(label);
     }
 
+    /// Toggle the active EQ preset on/off. Requires mpv's `af` filter.
+    pub async fn toggle_eq(&mut self) -> Result<()> {
+        let active = self.cfg.eq.preset.is_some();
+        if active {
+            self.cfg.eq.preset = None;
+            self.mpv.set_af("").await?;
+            self.show_toast("EQ: clean");
+        } else if let Some(chain) = self.cfg.active_eq_chain() {
+            let preset_name = self.cfg.eq.preset.clone().unwrap_or_default();
+            self.mpv.set_af(&chain).await?;
+            self.show_toast(format!("EQ: {preset_name}"));
+        } else {
+            self.show_toast("no EQ presets configured");
+        }
+        if let Err(e) = self.cfg.save() {
+            self.show_toast(format!("config write failed: {e}"));
+        }
+        Ok(())
+    }
+
+    /// Force the EQ back to clean/unfiltered.
+    pub async fn clear_eq(&mut self) -> Result<()> {
+        self.cfg.eq.preset = None;
+        self.mpv.set_af("").await?;
+        self.show_toast("EQ: clean");
+        if let Err(e) = self.cfg.save() {
+            self.show_toast(format!("config write failed: {e}"));
+        }
+        Ok(())
+    }
+
+    /// Rotate which preset is active (currently the first configured one).
+    pub fn eq_state(&self) -> String {
+        match &self.cfg.eq.preset {
+            Some(name) => format!("EQ: {name}"),
+            None => "EQ: off".to_string(),
+        }
+    }
+
+    pub fn enter_playlists(&mut self) {
+        self.playlist_names = playlists::list_playlists().unwrap_or_default();
+        self.playlist_cursor = 0;
+        self.mode = Mode::Playlists;
+    }
+
+    pub fn open_playlist(&mut self, name: Option<&str>) {
+        match name {
+            Some(name) => {
+                let Ok(tracks) = playlists::load_playlist(name) else {
+                    self.show_toast("could not load playlist");
+                    return;
+                };
+                self.active_playlist = Some(name.to_string());
+                self.playlist_tracks = tracks;
+            }
+            None => {
+                self.active_playlist = None; // liked
+                self.playlist_tracks = self.liked.clone();
+            }
+        }
+        self.playlist_cursor = 0;
+        self.mode = Mode::PlaylistDetail;
+    }
+
+    pub fn play_playlist_item(&mut self, idx: usize) {
+        if idx >= self.playlist_tracks.len() {
+            return;
+        }
+        self.queue.clear();
+        for t in &self.playlist_tracks[idx..] {
+            self.queue.push_back(t.clone());
+        }
+        self.cursor = 0;
+        self.mode = Mode::NowPlaying;
+        self.play_current();
+    }
+
+    pub fn remove_from_playlist(&mut self, idx: usize) {
+        if idx >= self.playlist_tracks.len() {
+            return;
+        }
+        self.playlist_tracks.remove(idx);
+        if let Some(name) = &self.active_playlist {
+            let _ = playlists::save_playlist(name, &self.playlist_tracks);
+        } else {
+            self.liked = self.playlist_tracks.clone();
+            let _ = playlists::save_liked(&self.liked);
+        }
+        self.playlist_cursor = self.playlist_cursor.min(self.playlist_tracks.len().saturating_sub(1));
+    }
+
+    pub fn delete_active_playlist(&mut self) {
+        let Some(name) = self.active_playlist.clone() else {
+            return;
+        };
+        let _ = playlists::delete_playlist(&name);
+        self.mode = Mode::Playlists;
+        self.enter_playlists();
+        self.show_toast(format!("deleted {name}"));
+    }
+
+    pub fn refresh_local(&mut self) {
+        self.local_tracks = library::scan_local_tracks(&self.cfg.local_dirs);
+        self.local_cursor = 0;
+    }
+
+    pub fn play_local_item(&mut self, idx: usize) {
+        if idx >= self.local_tracks.len() {
+            return;
+        }
+        self.queue.clear();
+        for t in &self.local_tracks[idx..] {
+            self.queue.push_back(t.clone());
+        }
+        self.cursor = 0;
+        self.mode = Mode::NowPlaying;
+        self.play_current();
+    }
+
     fn on_track_ended(&mut self) {
         if self.repeat == RepeatMode::One {
             self.play_current();
@@ -312,6 +567,10 @@ impl App {
             Mode::Search => self.handle_search_key(key).await?,
             Mode::NowPlaying => self.handle_now_playing_key(key).await?,
             Mode::Queue => self.handle_queue_key(key)?,
+            Mode::Prompt => self.handle_prompt_key(key).await?,
+            Mode::Playlists => self.handle_playlists_key(key)?,
+            Mode::PlaylistDetail => self.handle_playlist_detail_key(key)?,
+            Mode::Local => self.handle_local_key(key)?,
         }
         Ok(())
     }
@@ -329,6 +588,26 @@ impl App {
             }
             KeyCode::Enter => self.play_selection(),
             KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('l') => self.like_context(),
+            KeyCode::Char('o') | KeyCode::Char('t') => self.mode = Mode::Queue,
+            KeyCode::Char('L') => self.open_playlist(None),
+            KeyCode::Char('P') => self.enter_playlists(),
+            KeyCode::Char('y') => {
+                self.prompt = String::new();
+                self.prompt_kind = PromptKind::LoadYtPlaylist;
+                self.mode = Mode::Prompt;
+            }
+            KeyCode::Char('S') => {
+                self.prompt = String::new();
+                self.prompt_kind = PromptKind::SaveQueue;
+                self.mode = Mode::Prompt;
+            }
+            KeyCode::Char('u') => {
+                self.refresh_local();
+                self.mode = Mode::Local;
+            }
+            KeyCode::Char('e') => self.toggle_eq().await?,
+            KeyCode::Char('x') => self.clear_eq().await?,
             KeyCode::Char(c) if !c.is_control() => {
                 self.query.push(c);
                 self.start_search_seq(self.query.clone());
@@ -346,7 +625,26 @@ impl App {
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
             KeyCode::Char('s') | KeyCode::Char('/') => self.mode = Mode::Search,
-            KeyCode::Char('o') => self.mode = Mode::Queue,
+            KeyCode::Char('o') | KeyCode::Char('t') => self.mode = Mode::Queue,
+            KeyCode::Char('l') => self.like_context(),
+            KeyCode::Char('L') => self.open_playlist(None),
+            KeyCode::Char('P') => self.enter_playlists(),
+            KeyCode::Char('y') => {
+                self.prompt = String::new();
+                self.prompt_kind = PromptKind::LoadYtPlaylist;
+                self.mode = Mode::Prompt;
+            }
+            KeyCode::Char('S') => {
+                self.prompt = String::new();
+                self.prompt_kind = PromptKind::SaveQueue;
+                self.mode = Mode::Prompt;
+            }
+            KeyCode::Char('u') => {
+                self.refresh_local();
+                self.mode = Mode::Local;
+            }
+            KeyCode::Char('e') => self.toggle_eq().await?,
+            KeyCode::Char('x') => self.clear_eq().await?,
             KeyCode::Char(' ') => self.mpv.play_pause().await?,
             KeyCode::Left => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -378,9 +676,6 @@ impl App {
             KeyCode::Char('p') => self.prev(),
             KeyCode::Char('r') => self.cycle_repeat(),
             KeyCode::Char('z') => self.toggle_shuffle(),
-            KeyCode::Char('t') => self.mode = Mode::Queue,
-            KeyCode::Char('k') => self.prev(),
-            KeyCode::Char('l') => self.next(),
             _ => {}
         }
         Ok(())
@@ -397,8 +692,123 @@ impl App {
             }
             KeyCode::Enter => self.play_queue_item(self.cursor),
             KeyCode::Char('d') | KeyCode::Delete => self.remove_queue_item(self.cursor),
+            KeyCode::Char('l') => self.like_context(),
+            KeyCode::Char('L') => self.open_playlist(None),
+            KeyCode::Char('P') => self.enter_playlists(),
             KeyCode::Char('z') => self.toggle_shuffle(),
             KeyCode::Char('r') => self.cycle_repeat(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_prompt_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::NowPlaying,
+            KeyCode::Enter => {
+                let value = self.prompt.trim().to_string();
+                self.mode = Mode::NowPlaying;
+                if value.is_empty() {
+                    self.show_toast("nothing entered");
+                    return Ok(());
+                }
+                match self.prompt_kind {
+                    PromptKind::SaveQueue => {
+                        if self.queue.is_empty() {
+                            self.show_toast("queue is empty");
+                            return Ok(());
+                        }
+                        let tracks: Vec<Track> = self.queue.iter().cloned().collect();
+                        if let Err(e) = playlists::save_playlist(&value, &tracks) {
+                            self.show_toast(format!("save failed: {e}"));
+                        } else {
+                            self.show_toast(format!("saved playlist '{value}'"));
+                        }
+                    }
+                    PromptKind::LoadYtPlaylist => {
+                        let tx = self.events.clone();
+                        tokio::spawn(async move {
+                            let cfg = innertube::config::scrape().await;
+                            let client = innertube::http_client();
+                            let result =
+                                innertube::playlist::fetch_playlist(&client, &cfg, &value).await;
+                            let result = result
+                                .map(|p| (p.title, p.tracks))
+                                .map_err(|e| e.to_string());
+                            let _ = tx.send(AppEvent::YtPlaylistLoaded { result });
+                        });
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                self.prompt.pop();
+            }
+            KeyCode::Char(c) if !c.is_control() => self.prompt.push(c),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_playlists_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('P') => self.mode = Mode::NowPlaying,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.playlist_cursor = self.playlist_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.playlist_cursor =
+                    (self.playlist_cursor + 1).min(self.playlist_names.len().saturating_sub(1));
+            }
+            KeyCode::Char('L') => self.open_playlist(None),
+            KeyCode::Enter => {
+                if let Some(name) = self.playlist_names.get(self.playlist_cursor).cloned() {
+                    self.open_playlist(Some(&name));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_playlist_detail_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Playlists,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.playlist_cursor = self.playlist_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.playlist_cursor =
+                    (self.playlist_cursor + 1).min(self.playlist_tracks.len().saturating_sub(1));
+            }
+            KeyCode::Enter => self.play_playlist_item(self.playlist_cursor),
+            KeyCode::Char('l') => {
+                if let Some(t) = self.playlist_tracks.get(self.playlist_cursor).cloned() {
+                    self.toggle_like(&t);
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete => self.remove_from_playlist(self.playlist_cursor),
+            KeyCode::Char('x') if self.active_playlist.is_some() => self.delete_active_playlist(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_local_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('u') => self.mode = Mode::NowPlaying,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.local_cursor = self.local_cursor.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.local_cursor =
+                    (self.local_cursor + 1).min(self.local_tracks.len().saturating_sub(1));
+            }
+            KeyCode::Enter => self.play_local_item(self.local_cursor),
+            KeyCode::Char('l') => {
+                if let Some(t) = self.local_tracks.get(self.local_cursor).cloned() {
+                    self.toggle_like(&t);
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -420,10 +830,21 @@ impl App {
             cursor: self.cursor,
             current: self.current.clone(),
             art: self.current_art.clone(),
+            current_codec: self.current_codec.clone(),
             shuffle: self.shuffle,
             repeat: self.repeat,
             playback,
             toast: self.toast.as_ref().map(|(m, _)| m.clone()),
+            liked_keys: self.liked.iter().map(|t| t.key()).collect(),
+            playlist_names: self.playlist_names.clone(),
+            playlist_cursor: self.playlist_cursor,
+            active_playlist: self.active_playlist.clone(),
+            playlist_tracks: self.playlist_tracks.clone(),
+            local_tracks: self.local_tracks.clone(),
+            local_cursor: self.local_cursor,
+            prompt: self.prompt.clone(),
+            prompt_kind: self.prompt_kind,
+            eq: self.eq_state(),
         }
     }
 }
@@ -436,10 +857,21 @@ pub struct ViewData {
     pub cursor: usize,
     pub current: Option<Track>,
     pub art: Option<Art>,
+    pub current_codec: Option<String>,
     pub shuffle: bool,
     pub repeat: RepeatMode,
     pub playback: crate::mpv::PlaybackState,
     pub toast: Option<String>,
+    pub liked_keys: Vec<String>,
+    pub playlist_names: Vec<String>,
+    pub playlist_cursor: usize,
+    pub active_playlist: Option<String>,
+    pub playlist_tracks: Vec<Track>,
+    pub local_tracks: Vec<Track>,
+    pub local_cursor: usize,
+    pub prompt: String,
+    pub prompt_kind: PromptKind,
+    pub eq: String,
 }
 
 async fn search_inner(query: &str) -> Result<Vec<Track>> {

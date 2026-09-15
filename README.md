@@ -10,11 +10,22 @@ full-screen terminal album art — all without the YouTube web player.
 ## Features
 
 - **Direct InnerTube streaming** — no browser, no cookies, no YouTube web client.
+- **Codec-aware streaming** — picks the best Opus (itag 251) or AAC (itag 140)
+  audio-only stream automatically, or honours a preferred codec from the config.
 - **Reliable stream resolution** — tries the pre-signed `VISIONOS` client first,
   falls back through other clients, an in-house `nsig` decipher, and finally the
   `yt-dlp` binary you may already have installed.
 - **`mpv`-powered playback engine** — controls mpv over a JSON-RPC Unix socket with
   real-time playback state (`time-pos`, duration, volume, pause, title).
+- **Local file library** — browse and play FLAC / OPUS / OGG / M4A / MP3 / AAC
+  files from your local directories through the same mpv engine.
+- **Playlists** — one-key *Like* with a persistent Liked list, named playlists
+  saved from the queue, and full YouTube Music playlists via URL.
+- **Deep-bass EQ** — a built-in EQ preset (bass/mid/treble) applied through mpv's
+  `af` chain, toggle with one key, persisted in the config.
+- **Resilient playback** — a dead/stalled stream is re-resolved once and, if it
+  fails again, playback moves on to the next track.
+- **Song-only search** — video and episode results are filtered out of search.
 - **Terminal album art** — rasterised, half-block art rendered from the track
   thumbnail, cached under `~/.cache/lastwave/art`.
 - **Persistent search history** and an autoplaying queue with shuffle/repeat.
@@ -115,7 +126,17 @@ volume = 100
 mpv_path = "mpv"
 cache_dir = "/home/you/.cache/lastwave"
 autoplay = true
+codec = "best"          # "best" | "opus" | "aac"
+local_dirs = ["/home/you/Music"]
+eq = { preset = "Deep Bass", presets = [
+    { name = "Deep Bass", bass = 12, mid = 0, treble = -2 }
+] }
 ```
+
+- `codec` — preferred stream codec (`best`, `opus`, `aac`).
+- `local_dirs` — folders scanned for the local file library (`u`).
+- `eq` — `preset` names an active preset from `presets`. Each preset maps its
+  **bass/mid/treble** gains to an mpv filter chain.
 
 ## Controls
 
@@ -130,6 +151,14 @@ autoplay = true
 | `n` / `p` | Next / previous track |
 | `r` | Cycle repeat mode |
 | `z` | Toggle shuffle |
+| `l` | Like / unlike current track |
+| `L` | Open the Liked playlist |
+| `P` | Browse playlists |
+| `y` | Load a YouTube Music playlist (URL or id) |
+| `S` | Save current queue as a playlist |
+| `u` | Local file library |
+| `e` | Toggle the EQ preset |
+| `x` | Force clean (no EQ) |
 | `s` or `/` | Search |
 | `o` or `t` | Open the queue |
 | `?` | Help overlay |
@@ -143,6 +172,7 @@ autoplay = true
 | `Backspace` | Remove last character |
 | `↑` / `↓` | Select result |
 | `Enter` | Play selected result |
+| `l` | Like / unlike selected result |
 | `Esc` | Back to Now Playing |
 
 ### Queue
@@ -156,6 +186,17 @@ autoplay = true
 | `r` | Cycle repeat mode |
 | `Esc`, `o` or `t` | Back to Now Playing |
 
+### Playlists & Local
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` or `k` / `j` | Move selection |
+| `Enter` | Play selected playlist / track |
+| `l` | Like / unlike a track |
+| `d` / `Delete` | Remove from playlist (detail view) |
+| `x` | Delete the playlist entirely (detail view) |
+| `Esc` (`P`/`u` to re-enter) | Back to Now Playing |
+
 ## How streaming works
 
 Every video id goes through `resolve_stream`:
@@ -163,7 +204,8 @@ Every video id goes through `resolve_stream`:
 1. **`VISIONOS` client** — the same pre-signed client yt-dlp favours upstream.
    Sends a player request with a Safari device context to
    `https://www.youtube.com/youtubei/v1/player` and picks the best audio-only
-   format (itag 251 > 140 > 141 > 139).
+   format for the configured codec — Opus (itag 251) or AAC (itag 140), falling
+   back through lower-bitrate formats as needed.
 2. **Verification** — every candidate URL is checked with a small ranged GET
    before playback; dead/bot-gated URLs are skipped.
 3. **`nsig` decipher** — if a valid URL carries an `n` challenge, we try to
@@ -178,15 +220,18 @@ Every video id goes through `resolve_stream`:
 ```
 src/
 ├── main.rs              # CLI entry point (clap)
-├── config.rs            # ~/.config/lastwave/config.toml handling
-├── model.rs             # Track model
-├── mpv.rs               # mpv JSON-RPC engine + playback state
+├── config.rs            # ~/.config/lastwave/config.toml handling (codec, EQ, local dirs)
+├── model.rs             # Track model (YT Music + local files)
+├── library.rs           # Local FLAC/Opus library scanner
+├── playlists.rs         # Liked + named playlist JSON store
+├── mpv.rs               # mpv JSON-RPC engine + playback state + EQ chain
 ├── art.rs               # Terminal album art rendering
 ├── tui/                 # ratatui interface (app + view)
 └── innertube/           # Direct InnerTube API client
     ├── config.rs        # Innertube config scraping (key, client version…)
-    ├── search.rs        # YouTube Music search
-    ├── player.rs        # multi-client stream resolution + verification
+    ├── search.rs        # YouTube Music search (+ song-only filtering)
+    ├── player.rs        # multi-client stream resolution + codec pick + verification
+    ├── playlist.rs      # YouTube Music playlist fetching (continuations)
     ├── nsig.rs          # QuickJS-powered nsig decipher
     └── ytdl.rs          # yt-dlp fallback resolver
 ```

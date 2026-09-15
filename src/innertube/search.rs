@@ -3,11 +3,16 @@ use reqwest::Client;
 use serde_json::Value;
 
 use super::{
-    SEARCH_FILTER_SONGS, config::InnertubeConfig, context, http_client, post_json, run_text,
+    SEARCH_FILTER_SONGS, config::InnertubeConfig, context, http_client, post_json,
 };
 use crate::model::Track;
 
 /// Search YouTube Music for songs and parse them into `Track`s.
+///
+/// The songs filter still mixes video/artist/episode shelves into the
+/// response, so matching rows are classified individually via their category
+/// label and navigation metadata; anything that is clearly not a song is
+/// dropped.
 pub async fn search_songs(cfg: &InnertubeConfig, query: &str) -> anyhow::Result<Vec<Track>> {
     let client = http_client();
     let mut ctx = cfg.clone();
@@ -16,7 +21,7 @@ pub async fn search_songs(cfg: &InnertubeConfig, query: &str) -> anyhow::Result<
         // Some clients drop the shelf with certain filters; retry unfiltered.
         parsed = search_with(&client, &mut ctx, query, None).await?;
     }
-    Ok(parsed)
+    Ok(parsed.into_iter().filter(is_song_item).collect())
 }
 
 async fn search_with(
@@ -40,7 +45,7 @@ async fn search_with(
 
 /// Recursively collect every `musicResponsiveListItemRenderer` object in the
 /// response, regardless of which shelf section it appears under.
-fn collect_list_items(root: &Value) -> Vec<&Value> {
+pub fn collect_list_items(root: &Value) -> Vec<&Value> {
     let mut out = Vec::new();
     fn walk<'a>(node: &'a Value, out: &mut Vec<&'a Value>) {
         match node {
@@ -64,7 +69,134 @@ fn collect_list_items(root: &Value) -> Vec<&Value> {
     out
 }
 
-fn parse_list_item(renderer: &Value) -> Option<Track> {
+/// Category labels that appear as the first secondary-column run of a
+/// responsive list item on the web client.
+const NON_SONG_CATEGORIES: &[&str] = &[
+    "video",
+    "episode",
+    "podcast",
+    "album",
+    "artist",
+    "playlist",
+    "channel",
+    "community post",
+    "post",
+    "station",
+];
+
+/// Every category label the row parser recognises, including songs.
+const CATEGORY_LABELS: &[&str] = &[
+    "song",
+    "single",
+    "track",
+    "video",
+    "episode",
+    "podcast",
+    "album",
+    "artist",
+    "playlist",
+    "channel",
+    "station",
+    "community post",
+    "post",
+];
+
+fn is_category_label(text: &str) -> bool {
+    let t = text.trim().to_ascii_lowercase();
+    CATEGORY_LABELS.contains(&t.as_str())
+}
+
+/// Decide whether a parsed row is a playable song rather than a video,
+/// episode, artist, album or playlist row.
+fn is_song_item(track: &Track) -> bool {
+    if let Some(cat) = track.category.as_deref() {
+        // "Song"/"Single" labels are unambiguously music.
+        if matches!(cat.to_ascii_lowercase().as_str(), "song" | "single") {
+            return true;
+        }
+        return !NON_SONG_CATEGORIES.contains(&cat.to_ascii_lowercase().as_str());
+    }
+    // No category label (older clients): keep rows that resolve to an artist
+    // or an album browse endpoint; those are music, not plain video rows.
+    track.album.is_some() || track.artist_id.is_some()
+}
+
+/// A parsed flexible column: title row plus secondary-column details.
+struct ParsedRow {
+    category: Option<String>,
+    artist: Option<String>,
+    artist_id: Option<String>,
+    album: Option<String>,
+    duration: Option<u32>,
+}
+
+fn parse_secondary(text: &Value) -> ParsedRow {
+    let runs = text
+        .pointer("/runs")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut row = ParsedRow {
+        category: None,
+        artist: None,
+        artist_id: None,
+        album: None,
+        duration: None,
+    };
+    for run in &runs {
+        let run_text = run.get("text").and_then(Value::as_str).unwrap_or("");
+        let browse_id = run
+            .pointer("/navigationEndpoint/browseEndpoint/browseId")
+            .and_then(Value::as_str);
+        if let Some(id) = browse_id {
+            if id.starts_with("UC") && row.artist.is_none() {
+                row.artist = Some(run_text.to_string());
+                row.artist_id = Some(id.to_string());
+            } else if id.starts_with("MPRE") && row.album.is_none() {
+                row.album = Some(run_text.to_string());
+            }
+        } else if row.category.is_none() && !run_text.trim().is_empty() {
+            // A category label is a plain run whose text is a known label.
+            if is_category_label(run_text) {
+                row.category = Some(run_text.trim().to_string());
+            }
+        }
+        if row.duration.is_none() {
+            row.duration = parse_duration(run_text);
+        }
+    }
+    row
+}
+
+/// Fall back to plain text splitting for clients that do not attach
+/// navigation to each run ("Artist · Album" or "Song • Artist").
+fn secondary_from_text(text: &Value) -> ParsedRow {
+    let joined = join_runs(text);
+    let mut row = ParsedRow {
+        category: None,
+        artist: None,
+        artist_id: None,
+        album: None,
+        duration: None,
+    };
+    let separator = if joined.contains(" • ") { " • " } else { " · " };
+    let mut parts: Vec<&str> = joined.split(separator).collect();
+    if parts.first().is_some_and(|p| {
+        let p = p.trim().to_ascii_lowercase();
+        p == "song" || p == "single" || NON_SONG_CATEGORIES.contains(&p.as_str())
+    }) {
+        row.category = Some(parts.remove(0).trim().to_string());
+    }
+    if let Some(first) = parts.first() {
+        row.artist = Some(first.trim().to_string());
+    }
+    if parts.len() > 1 {
+        row.album = Some(parts[1].trim().to_string());
+    }
+    row
+}
+
+pub fn parse_list_item(renderer: &Value) -> Option<Track> {
     let flex = renderer.get("flexColumns")?.as_array()?;
 
     let title_col = flex.first()?;
@@ -79,20 +211,28 @@ fn parse_list_item(renderer: &Value) -> Option<Track> {
         video_id = Some(id.to_string());
     }
 
-    // Secondary flex column holds "artist · album" or just "artist".
-    let mut artist = String::new();
-    let mut album = None;
-    if let Some(col) = flex.get(1) {
-        let text = col
-            .pointer("/musicResponsiveListItemFlexColumnRenderer/text")
-            .and_then(run_text)?;
-        if let Some((a, b)) = text.rsplit_once(" · ") {
-            artist = a.to_string();
-            album = Some(b.to_string());
-        } else {
-            artist = text;
+    // Secondary flex column holds "artist · album", "Song • artist", or a
+    // "Video ..."/"Episode ..." category row.
+    let detail = flex.get(1).and_then(|col| {
+        col.pointer("/musicResponsiveListItemFlexColumnRenderer/text")
+    });
+    let row = match detail {
+        Some(text) => {
+            let nav_rows = parse_secondary(text);
+            if nav_rows.artist.is_none() {
+                secondary_from_text(text)
+            } else {
+                nav_rows
+            }
         }
-    }
+        None => ParsedRow {
+            category: None,
+            artist: None,
+            artist_id: None,
+            album: None,
+            duration: None,
+        },
+    };
 
     // Try the overlay thumbnail, then the direct thumbnail slot.
     let thumbnail = renderer
@@ -111,7 +251,8 @@ fn parse_list_item(renderer: &Value) -> Option<Track> {
     let duration_text = renderer
         .pointer("/fixedColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text")
         .and_then(Value::as_str)
-        .and_then(parse_duration);
+        .and_then(parse_duration)
+        .or(row.duration);
 
     let video_id = video_id.or_else(|| {
         renderer
@@ -123,10 +264,15 @@ fn parse_list_item(renderer: &Value) -> Option<Track> {
     Some(Track {
         video_id,
         title,
-        artist: clean_secondary(artist),
-        album,
+        artist: row.artist.clone().unwrap_or_else(|| {
+            "Unknown artist".to_string()
+        }),
+        album: row.album,
         thumbnail_url: clean_thumbnail(thumbnail),
         duration: duration_text,
+        category: row.category,
+        artist_id: row.artist_id,
+        source: Default::default(),
     })
 }
 
@@ -137,9 +283,19 @@ fn parse_title(node: &Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn clean_secondary(s: String) -> String {
-    // YT Music separates artist and album with " · " (U+00B7) or "-".
-    s
+/// Join all run texts in a text node when present, else the simpleText.
+fn join_runs(node: &Value) -> String {
+    if let Some(runs) = node.get("runs").and_then(Value::as_array) {
+        return runs
+            .iter()
+            .filter_map(|r| r.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("");
+    }
+    node.get("simpleText")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn clean_thumbnail(u: Option<String>) -> Option<String> {
