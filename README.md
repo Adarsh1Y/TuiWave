@@ -35,7 +35,7 @@ bot-gating outpaces the direct resolver.
 ### One-liner (recommended)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Adarsh1Y/TuiWave/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Adarsh1Y/TuiWave/master/install.sh | sh
 ```
 
 Installs the latest prebuilt binary to `~/.local/bin/lastwave`.
