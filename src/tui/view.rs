@@ -60,10 +60,19 @@ fn track_line<'a>(t: &'a crate::model::Track, liked: bool, show_like: bool) -> L
             Style::default().fg(Color::Gray),
         ));
     }
-    spans.push(Span::styled(
-        format!("  {}", format_duration(t.duration)),
-        Style::default().fg(Color::Gray),
-    ));
+    if t.browse_id.is_some() {
+        if let Some(category) = &t.category {
+            spans.push(Span::styled(
+                format!("  [{category}]"),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+    } else {
+        spans.push(Span::styled(
+            format!("  {}", format_duration(t.duration)),
+            Style::default().fg(Color::Gray),
+        ));
+    }
     Line::from(spans)
 }
 
@@ -72,6 +81,7 @@ fn draw_search(frame: &mut Frame, data: &ViewData) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
@@ -90,17 +100,36 @@ fn draw_search(frame: &mut Frame, data: &ViewData) {
     );
     frame.set_cursor_position((chunks[0].x + 2 + data.query.len() as u16, chunks[0].y + 1));
 
+    let tab_line = Line::from(
+        [" Songs ", " Albums ", " Artists ", " Playlists "]
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let current = i == tab_index(data.search_tab);
+                Span::styled(
+                    label.to_string(),
+                    if current {
+                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    frame.render_widget(Paragraph::new(tab_line), chunks[1]);
+
     frame.render_widget(
-        footer("type: query   enter: play   alt+l: like   alt+h: history   esc: back   ctrl+c: quit"),
-        chunks[1],
+        footer("tab: switch type   enter: play   alt+g: open row   alt+l: like   alt+h: history   esc: back   ctrl+c: quit"),
+        chunks[2],
     );
 
     if data.results.is_empty() {
         frame.render_widget(
-            Paragraph::new("type to search — songs appear here")
+            Paragraph::new("type to search — results appear here")
                 .style(Style::default().fg(Color::DarkGray))
                 .alignment(Alignment::Center),
-            chunks[2],
+            chunks[3],
         );
     } else {
         let items: Vec<ListItem> = data
@@ -121,14 +150,24 @@ fn draw_search(frame: &mut Frame, data: &ViewData) {
             .highlight_symbol("▶ ");
         frame.render_stateful_widget(
             list,
-            chunks[2],
+            chunks[3],
             &mut ratatui::widgets::ListState::default().with_selected(Some(
                 data.selected.min(data.results.len().saturating_sub(1)),
             )),
         );
     }
 
-    frame.render_widget(footer("lastwave — bare letters type"), chunks[3]);
+    frame.render_widget(footer("lastwave — bare letters type"), chunks[4]);
+}
+
+fn tab_index(tab: crate::innertube::SearchTab) -> usize {
+    use crate::innertube::SearchTab;
+    match tab {
+        SearchTab::Songs => 0,
+        SearchTab::Albums => 1,
+        SearchTab::Artists => 2,
+        SearchTab::Playlists => 3,
+    }
 }
 
 fn draw_now_playing(frame: &mut Frame, data: &ViewData) {
@@ -218,6 +257,8 @@ fn draw_now_playing(frame: &mut Frame, data: &ViewData) {
         Span::styled("alt+r repeat  ", Style::default().fg(Color::Blue)),
         Span::styled("alt+z shuffle  ", Style::default().fg(Color::Blue)),
         Span::styled("alt+e/alt+x eq  ", Style::default().fg(Color::Blue)),
+        Span::styled("alt+R radio  ", Style::default().fg(Color::Blue)),
+        Span::styled("alt+g artist  ", Style::default().fg(Color::Blue)),
         Span::styled("s search  ", Style::default().fg(Color::Blue)),
         Span::styled("alt+h history  ", Style::default().fg(Color::Blue)),
         Span::styled("q quit", Style::default().fg(Color::Blue)),
@@ -230,6 +271,7 @@ fn draw_now_playing(frame: &mut Frame, data: &ViewData) {
         RepeatMode::All => " 🔁",
         RepeatMode::One => " 🔂",
     }));
+    line.push(Span::raw(if data.radio { " 📻" } else { "" }));
     frame.render_widget(Paragraph::new(Line::from(line)), outer[1]);
 
     render_art_area(frame, inner[1], data);
@@ -310,7 +352,7 @@ fn draw_queue(frame: &mut Frame, data: &ViewData) {
     }
 
     frame.render_widget(
-        footer("enter: play   alt+l: like   alt+d: remove   alt+o/alt+t: back   j/k: move   esc: back"),
+        footer("enter: play   alt+l: like   alt+d: remove   alt+g: open row   alt+R: radio   alt+o/alt+t: back   j/k: move   esc: back"),
         chunks[2],
     );
 }
@@ -586,11 +628,14 @@ fn draw_help(frame: &mut Frame) {
         "   ← / →            seek 10s (shift: 60s)\n",
         "   , / .            volume down / up\n",
         "   j / k            move down / up (lists)\n",
+        "   tab / shift+tab  switch search type (songs/albums/artists/playlists)\n",
         "   alt+n / alt+p    next / previous\n",
         "   alt+l            like / unlike (heart)\n",
         "   alt+L            open Liked Songs\n",
         "   alt+P            open playlists\n",
         "   alt+o / alt+t    open queue\n",
+        "   alt+g            open row / artist page\n",
+        "   alt+R            radio: endless mode (extends the queue)\n",
         "   alt+y            load a YouTube Music playlist\n",
         "   alt+S            save current queue as playlist\n",
         "   alt+u            local files (FLAC/Opus/MP3)\n",
@@ -602,7 +647,7 @@ fn draw_help(frame: &mut Frame) {
         "   bare letters type in search; alt+letter acts\n",
         "   press any key to close",
     );
-    let area = centered(70, 27, frame.area());
+    let area = centered(74, 29, frame.area());
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(text)

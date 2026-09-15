@@ -9,7 +9,7 @@ use crate::art::Art;
 use crate::backend::{Backend, Event};
 use crate::config::Config;
 use crate::innertube;
-use crate::innertube::StreamFormat;
+use crate::innertube::{SearchTab, StreamFormat};
 use crate::library;
 use crate::model::{Track, TrackSource};
 use crate::playlists;
@@ -60,6 +60,14 @@ pub enum AppEvent {
         track_video_id: String,
         art: Option<Art>,
     },
+    BrowseLoaded {
+        label: String,
+        result: Result<Vec<Track>, String>,
+    },
+    RadioLoaded {
+        seed: String,
+        tracks: Vec<Track>,
+    },
     Playback(Event),
 }
 
@@ -83,6 +91,8 @@ pub struct App {
     pub current_codec: Option<String>,
     pub shuffle: bool,
     pub repeat: RepeatMode,
+    pub radio: bool,
+    pub search_tab: SearchTab,
     pub toast: Option<(String, Instant)>,
     pub backend: Backend,
     pub events: mpsc::UnboundedSender<AppEvent>,
@@ -120,6 +130,8 @@ impl App {
             current_codec: None,
             shuffle: false,
             repeat: RepeatMode::Off,
+            radio: false,
+            search_tab: SearchTab::Songs,
             toast: None,
             backend,
             events,
@@ -279,6 +291,38 @@ impl App {
                     self.current_art = art;
                 }
             }
+            AppEvent::BrowseLoaded { label, result } => {
+                match result {
+                    Ok(tracks) => {
+                        if tracks.is_empty() {
+                            self.show_toast(format!("{label}: no tracks"));
+                            return;
+                        }
+                        self.queue.clear();
+                        self.queue.extend(tracks);
+                        self.cursor = 0;
+                        self.play_current();
+                        self.show_toast(format!("{label} — {} tracks", self.queue.len()));
+                    }
+                    Err(e) => self.show_toast(format!("{label}: {e}")),
+                }
+            }
+            AppEvent::RadioLoaded { seed, tracks } => {
+                if seed != self.current.as_ref().map(|t| t.video_id.clone()).unwrap_or_default() {
+                    return;
+                }
+                if tracks.is_empty() {
+                    self.show_toast("radio: nothing found");
+                    return;
+                }
+                let known: Vec<String> = self.queue.iter().map(Track::key).collect();
+                for t in tracks {
+                    if !known.contains(&t.key()) {
+                        self.queue.push_back(t);
+                    }
+                }
+                self.next();
+            }
             AppEvent::Playback(Event::EndFile { reason }) => {
                 match reason.as_str() {
                     "eof" | "end-of-file" => {
@@ -319,10 +363,11 @@ impl App {
         let seq = self.search_seq;
         let q = query.clone();
         let tx = self.events.clone();
+        let tab = self.search_tab;
         self.results.clear();
         self.selected = 0;
         tokio::spawn(async move {
-            let result = search_inner(&q).await;
+            let result = search_inner(&q, tab).await;
             let _ = tx.send(AppEvent::SearchResults {
                 seq,
                 result: result.map_err(|e| e.to_string()),
@@ -335,6 +380,12 @@ impl App {
             return;
         }
         let idx = self.selected.min(self.results.len().saturating_sub(1));
+        if let Some(t) = self.results.get(idx)
+            && t.browse_id.is_some()
+        {
+            self.go_to_selected();
+            return;
+        }
         self.queue.clear();
         for t in &self.results[idx..] {
             self.queue.push_back(t.clone());
@@ -598,7 +649,101 @@ impl App {
             self.play_current();
             return;
         }
+        let at_end = self.cursor + 1 >= self.queue.len();
+        if self.radio && at_end {
+            // The queue is exhausted — extend it from the track that ended.
+            if let Some(t) = self.current.clone() {
+                self.fetch_radio(&t);
+                self.show_toast(format!("radio: loading {}", t.artist));
+            }
+            return;
+        }
         self.next();
+    }
+
+    pub fn toggle_radio(&mut self) {
+        self.radio = !self.radio;
+        self.show_toast(if self.radio {
+            "radio: endless mode on"
+        } else {
+            "radio: off"
+        });
+    }
+
+    /// Alt+g from Now Playing: open the current track's artist page.
+    pub fn go_to_artist(&mut self) {
+        let Some(track) = self.current.clone() else {
+            self.show_toast("nothing playing");
+            return;
+        };
+        let Some(artist_id) = track.artist_id.clone() else {
+            self.show_toast("no artist page for this track");
+            return;
+        };
+        self.browse_and_play(&artist_id, &track.artist);
+    }
+
+    /// Alt+g from a list: open a selected album/artist/playlist card, or the
+    /// selected track's artist page.
+    pub fn go_to_selected(&mut self) {
+        let track = self.current_selected().cloned();
+        let Some(ref track) = track else {
+            return;
+        };
+        if let Some(browse_id) = track.browse_id.clone() {
+            self.browse_and_play(&browse_id, &track.title);
+            return;
+        }
+        if let Some(artist_id) = track.artist_id.clone() {
+            self.browse_and_play(&artist_id, &track.artist);
+            return;
+        }
+        self.show_toast("no artist/album page for this row");
+    }
+
+    /// The track currently highlighted in the active list mode.
+    fn current_selected(&self) -> Option<&Track> {
+        match self.mode {
+            Mode::Search => self.results.get(self.selected),
+            Mode::Queue => self.queue.get(self.cursor),
+            Mode::PlaylistDetail => self.playlist_tracks.get(self.playlist_cursor),
+            Mode::Local => self.local_tracks.get(self.local_cursor),
+            Mode::History => self.history.get(self.history_cursor),
+            _ => None,
+        }
+    }
+
+    /// Replace the queue with a browse page's songs and start playing.
+    fn browse_and_play(&mut self, browse_id: &str, label: &str) {
+        let tx = self.events.clone();
+        let browse_id = browse_id.to_string();
+        let label = label.to_string();
+        self.show_toast(format!("fetching {}", label));
+        self.mode = Mode::NowPlaying;
+        tokio::spawn(async move {
+            let cfg = innertube::config::scrape().await;
+            let client = innertube::http_client();
+            let result =
+                innertube::radio::fetch_browse_tracks(&client, &cfg, &browse_id, 60).await;
+            let _ = tx.send(AppEvent::BrowseLoaded {
+                label,
+                result: result.map_err(|e| e.to_string()),
+            });
+        });
+    }
+
+    /// Ask innertube for a radio station built from `track` and extend the
+    /// queue with it once the response arrives.
+    fn fetch_radio(&mut self, track: &Track) {
+        let tx = self.events.clone();
+        let seed = track.video_id.clone();
+        tokio::spawn(async move {
+            let cfg = innertube::config::scrape().await;
+            let client = innertube::http_client();
+            let tracks =
+                innertube::radio::fetch_radio(&client, &cfg, &seed).await.unwrap_or_default();
+            let _ = tx.send(AppEvent::RadioLoaded { seed, tracks });
+        });
     }
 
     fn fetch_art_async(&mut self, track: &Track) {
@@ -684,6 +829,8 @@ impl App {
             return Ok(());
         }
         match key.code {
+            KeyCode::BackTab => self.cycle_search_tab(false),
+            KeyCode::Tab => self.cycle_search_tab(true),
             KeyCode::Esc => self.mode = Mode::NowPlaying,
             KeyCode::Backspace => {
                 self.query.pop();
@@ -707,6 +854,27 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Rotate the search result type and re-run the current query.
+    fn cycle_search_tab(&mut self, forward: bool) {
+        let tabs = [
+            SearchTab::Songs,
+            SearchTab::Albums,
+            SearchTab::Artists,
+            SearchTab::Playlists,
+        ];
+        let idx = tabs.iter().position(|t| *t == self.search_tab).unwrap_or(0);
+        let next = if forward {
+            (idx + 1) % tabs.len()
+        } else {
+            (idx + tabs.len() - 1) % tabs.len()
+        };
+        self.search_tab = tabs[next];
+        self.show_toast(format!("searching: {}", self.search_tab.label()));
+        if !self.query.is_empty() {
+            self.start_search_seq(self.query.clone());
+        }
     }
 
     async fn handle_now_playing_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -763,6 +931,12 @@ impl App {
                 Ok(None) => self.show_toast("no other audio outputs"),
                 Err(e) => self.show_toast(format!("audio switch failed: {e}")),
             }
+        }
+        if alt(&key, 'R') {
+            self.toggle_radio();
+        }
+        if alt(&key, 'g') {
+            self.go_to_artist();
         }
         match key.code {
             KeyCode::Char('q') => anyhow::bail!("quit"),
@@ -824,6 +998,12 @@ impl App {
         }
         if alt(&key, 'd') {
             self.remove_queue_item(self.cursor);
+        }
+        if alt(&key, 'R') {
+            self.toggle_radio();
+        }
+        if alt(&key, 'g') {
+            self.go_to_selected();
         }
         match key.code {
             KeyCode::Esc => self.mode = Mode::NowPlaying,
@@ -1028,6 +1208,8 @@ impl App {
             current_codec: self.current_codec.clone(),
             shuffle: self.shuffle,
             repeat: self.repeat,
+            radio: self.radio,
+            search_tab: self.search_tab,
             playback,
             toast: self.toast.as_ref().map(|(m, _)| m.clone()),
             liked_keys: self.liked.iter().map(|t| t.key()).collect(),
@@ -1113,6 +1295,8 @@ pub struct ViewData {
     pub current_codec: Option<String>,
     pub shuffle: bool,
     pub repeat: RepeatMode,
+    pub radio: bool,
+    pub search_tab: SearchTab,
     pub playback: crate::mpv::PlaybackState,
     pub toast: Option<String>,
     pub liked_keys: Vec<String>,
@@ -1129,9 +1313,9 @@ pub struct ViewData {
     pub history_cursor: usize,
 }
 
-async fn search_inner(query: &str) -> Result<Vec<Track>> {
+async fn search_inner(query: &str, tab: SearchTab) -> Result<Vec<Track>> {
     let cfg = innertube::config::scrape().await;
-    innertube::search::search_songs(&cfg, query).await
+    innertube::search_tab(&cfg, query, tab).await
 }
 
 /// Tiny deterministic-ish rng for shuffle (no external dep).

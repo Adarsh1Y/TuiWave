@@ -23,6 +23,12 @@ pub struct Track {
     /// Artist browse id (channel id) when the row carries one.
     #[serde(default)]
     pub artist_id: Option<String>,
+    /// Album browse id (MPRE...) when the row carries one.
+    #[serde(default)]
+    pub album_id: Option<String>,
+    /// Primary browse target for non-song rows (album/artist/playlist card).
+    #[serde(default)]
+    pub browse_id: Option<String>,
     pub source: TrackSource,
 }
 
@@ -30,7 +36,15 @@ impl Track {
     /// Stable identity for deduplication / like tracking.
     pub fn key(&self) -> String {
         match &self.source {
-            TrackSource::YtMusic => self.video_id.clone(),
+            TrackSource::YtMusic => {
+                if !self.video_id.is_empty() {
+                    self.video_id.clone()
+                } else if let Some(browse_id) = &self.browse_id {
+                    format!("browse:{browse_id}")
+                } else {
+                    format!("yt:{}", self.title)
+                }
+            }
             TrackSource::LocalFile(path) => format!("file:{}", path.display()),
         }
     }

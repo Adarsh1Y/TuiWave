@@ -51,6 +51,8 @@ pub fn scan_local_tracks(dirs: &[PathBuf]) -> Vec<Track> {
                 duration: None,
                 category: None,
                 artist_id: None,
+                album_id: None,
+                browse_id: None,
                 source: TrackSource::LocalFile(path),
             }
         })

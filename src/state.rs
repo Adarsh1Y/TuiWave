@@ -119,6 +119,8 @@ mod tests {
             duration: Some(10),
             category: None,
             artist_id: None,
+            album_id: None,
+            browse_id: None,
             source: TrackSource::YtMusic,
         }
     }

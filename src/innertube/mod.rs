@@ -2,6 +2,7 @@ pub mod config;
 pub mod nsig;
 pub mod player;
 pub mod playlist;
+pub mod radio;
 pub mod search;
 pub mod ytdl;
 
@@ -68,6 +69,7 @@ fn is_login_required(value: &Value) -> bool {
 }
 
 pub use player::StreamFormat;
+pub use search::{SearchTab, search_tab};
 
 /// Resolve a direct, playable stream URL for a track. Tries the VISIONOS
 /// client first (pre-signed URLs, verified with a ranged GET), then the other

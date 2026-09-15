@@ -24,6 +24,74 @@ pub async fn search_songs(cfg: &InnertubeConfig, query: &str) -> anyhow::Result<
     Ok(parsed.into_iter().filter(is_song_item).collect())
 }
 
+/// Different search result types, matching the ytmusicapi filter params.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchTab {
+    Songs,
+    Albums,
+    Artists,
+    Playlists,
+}
+
+impl SearchTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            SearchTab::Songs => "Songs",
+            SearchTab::Albums => "Albums",
+            SearchTab::Artists => "Artists",
+            SearchTab::Playlists => "Playlists",
+        }
+    }
+
+    pub fn filter_param(self) -> Option<&'static str> {
+        match self {
+            SearchTab::Songs => Some(SEARCH_FILTER_SONGS),
+            SearchTab::Albums => Some("EgWKAQIYAWoKEAoQCRADEAA%3D"),
+            SearchTab::Artists => Some("EgWKAQIKAWoKEAoQCRADEAA%3D"),
+            SearchTab::Playlists => Some("EgWKAQILAWoKEAoQCRADEAA%3D"),
+        }
+    }
+}
+
+/// Search one result type and parse the rows into `Track`s. Song rows keep
+/// their video ids; album/artist/playlist rows set `browse_id` + `category`.
+///
+/// The web client ignores the filter `params` (it returns a mix of every
+/// result type regardless), so non-matching rows are dropped here instead.
+pub async fn search_tab(cfg: &InnertubeConfig, query: &str, tab: SearchTab) -> anyhow::Result<Vec<Track>> {
+    let client = http_client();
+    let mut ctx = cfg.clone();
+    let mut parsed =
+        search_with(&client, &mut ctx, query, tab.filter_param()).await?;
+    if parsed.is_empty() && !matches!(tab, SearchTab::Songs) {
+        parsed = search_with(&client, &mut ctx, query, None).await?;
+    }
+    Ok(parsed.into_iter().filter(|t| tab_matches(tab, t)).collect())
+}
+
+/// Whether a parsed row belongs in `tab`'s result category.
+fn tab_matches(tab: SearchTab, track: &Track) -> bool {
+    let cat = track.category.as_deref();
+    match tab {
+        SearchTab::Songs => is_song_item(track),
+        SearchTab::Albums => {
+            matches!(cat, Some("album" | "single"))
+                || track.album_id.is_some()
+        }
+        SearchTab::Artists => {
+            cat == Some("artist")
+                || track.browse_id.as_deref().is_some_and(|b| b.starts_with("UC"))
+        }
+        SearchTab::Playlists => {
+            cat == Some("playlist")
+                || track.browse_id.as_deref().is_some_and(|b| {
+                    b.starts_with("VL") || b.starts_with("PL") || b.starts_with("RDAM") || b.starts_with("RDCLAK")
+                })
+        }
+    }
+}
+
+/// Search YouTube Music, returning every parseable row for the given filter.
 async fn search_with(
     client: &Client,
     ctx: &mut InnertubeConfig,
@@ -39,8 +107,18 @@ async fn search_with(
         .await
         .context("search failed")?;
     let items = collect_list_items(&value);
-    let tracks: Vec<Track> = items.iter().filter_map(|it| parse_list_item(it)).collect();
-    Ok(tracks)
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for it in items {
+        let parsed = parse_list_item(it).or_else(|| parse_browse_row(it));
+        if let Some(track) = parsed {
+            let key = track.key();
+            if seen.insert(key) {
+                out.push(track);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Recursively collect every `musicResponsiveListItemRenderer` object in the
@@ -187,7 +265,9 @@ fn secondary_from_text(text: &Value) -> ParsedRow {
     }) {
         row.category = Some(parts.remove(0).trim().to_string());
     }
-    if let Some(first) = parts.first() {
+    if let Some(first) = parts.first()
+        && !first.trim().is_empty()
+    {
         row.artist = Some(first.trim().to_string());
     }
     if parts.len() > 1 {
@@ -256,6 +336,12 @@ pub fn parse_list_item(renderer: &Value) -> Option<Track> {
 
     let video_id = video_id.or_else(|| {
         renderer
+            .pointer("/navigationEndpoint/watchEndpoint/videoId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    let video_id = video_id.or_else(|| {
+        renderer
             .pointer("/playlistItemData/videoId")
             .and_then(Value::as_str)
             .map(str::to_string)
@@ -272,6 +358,8 @@ pub fn parse_list_item(renderer: &Value) -> Option<Track> {
         duration: duration_text,
         category: row.category,
         artist_id: row.artist_id,
+        album_id: None,
+        browse_id: None,
         source: Default::default(),
     })
 }
@@ -281,6 +369,151 @@ fn parse_title(node: &Value) -> Option<String> {
     node.pointer("/runs/0/text")
         .and_then(Value::as_str)
         .map(|s| s.to_string())
+}
+
+/// Parse a non-song search row (album, artist, playlist card). These carry a
+/// `browseEndpoint` instead of a watch endpoint; the track gets a `browse_id`
+/// and a category so the shell can act on it. Returns `None` when the row has
+/// no browse id at all (plain song/video rows).
+fn parse_browse_row(renderer: &Value) -> Option<Track> {
+    let flex = renderer.get("flexColumns")?.as_array()?;
+    let title_col = flex.first()?;
+    let title_node = title_col.pointer("/musicResponsiveListItemFlexColumnRenderer/text")?;
+    let title = parse_title(title_node)?;
+
+    // The whole-row navigation on album/artist/playlist cards carries the
+    // browse id + page type; older responses put it on the title run instead.
+    let (browse_id, page_type) = item_navigation(renderer);
+    let browse_id = browse_id.or_else(|| {
+        title_node
+            .pointer("/runs/0/navigationEndpoint/browseEndpoint/browseId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })?;
+
+    // Secondary column: "Album • Artist", "Artist • N subscribers", ...
+    let mut artist = None;
+    let mut artist_id = None;
+    for run in flex
+        .get(1)
+        .and_then(|col| col.pointer("/musicResponsiveListItemFlexColumnRenderer/text/runs"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let text = run.get("text").and_then(Value::as_str).unwrap_or("");
+        let is_artist = run
+            .pointer("/navigationEndpoint/browseEndpoint/browseId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("UC"));
+        if is_artist && artist.is_none() {
+            artist = Some(text.trim().to_string());
+            artist_id = run
+                .pointer("/navigationEndpoint/browseEndpoint/browseId")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+
+    let subtitle = flex
+        .get(1)
+        .and_then(|col| col.pointer("/musicResponsiveListItemFlexColumnRenderer/text"))
+        .map(join_runs)
+        .unwrap_or_default();
+
+    // Prefer the explicit page type; fall back to prefix + subtitle heuristics.
+    let category = page_type
+        .or_else(|| category_for_browse_id(&browse_id))
+        .map(str::to_string)
+        .or_else(|| {
+            subtitle.split(['•', '·', '\n']).find_map(|part| {
+                let part = part.trim().to_ascii_lowercase();
+                if is_category_label(&part) {
+                    Some(part)
+                } else {
+                    None
+                }
+            })
+        });
+
+    let video_id = renderer
+        .pointer("/playlistItemData/videoId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let thumbnail = renderer
+        .pointer("/thumbnail/musicThumbnailRenderer/thumbnail/thumbnails/0/url")
+        .or_else(|| renderer.pointer("/thumbnail/musicMultiThumbnailRenderer/thumbnail/thumbnails/0/url"))
+        .and_then(Value::as_str)
+        .map(|s| if s.starts_with("//") { format!("https:{s}") } else { s.to_string() });
+
+    let duration = renderer
+        .pointer("/fixedColumns/0/musicResponsiveListItemFlexColumnRenderer/text/runs/0/text")
+        .and_then(Value::as_str)
+        .and_then(parse_duration);
+
+    let album_id = browse_id
+        .starts_with("MPRE")
+        .then(|| browse_id.clone());
+    let artist_id = artist_id.or_else(|| {
+        browse_id
+            .starts_with("UC")
+            .then(|| browse_id.clone())
+    });
+
+    // Artist cards carry the artist's name in the title column only.
+    let mut artist = artist.unwrap_or_else(|| "Unknown artist".to_string());
+    if category.as_deref() == Some("artist") || browse_id.starts_with("UC") {
+        artist = title.clone();
+    }
+
+    Some(Track {
+        video_id,
+        title,
+        artist,
+        album: None,
+        thumbnail_url: thumbnail,
+        duration,
+        category,
+        artist_id,
+        album_id,
+        browse_id: Some(browse_id),
+        source: Default::default(),
+    })
+}
+
+/// Extract the whole-row navigation on a list item: the browse id (album,
+/// artist, playlist, ...) and the normalized page type, when present.
+fn item_navigation(renderer: &Value) -> (Option<String>, Option<&'static str>) {
+    let browse_id = renderer
+        .pointer("/navigationEndpoint/browseEndpoint/browseId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let page_type = renderer
+        .pointer("/navigationEndpoint/browseEndpoint/browseEndpointContextSupportedConfigs/browseEndpointContextMusicConfig/pageType")
+        .and_then(Value::as_str)
+        .and_then(|p| match p {
+            "MUSIC_PAGE_TYPE_ALBUM" => Some("album"),
+            "MUSIC_PAGE_TYPE_SINGLE" => Some("single"),
+            "MUSIC_PAGE_TYPE_ARTIST" => Some("artist"),
+            "MUSIC_PAGE_TYPE_PLAYLIST" => Some("playlist"),
+            _ => None,
+        });
+    (browse_id, page_type)
+}
+
+/// Map a browse id prefix to a result category label.
+fn category_for_browse_id(id: &str) -> Option<&'static str> {
+    if id.starts_with("MPRE") {
+        Some("album")
+    } else if id.starts_with("UC") {
+        Some("artist")
+    } else if id.starts_with("VL") || id.starts_with("PL") || id.starts_with("RDAM") || id.starts_with("RDCLAK") {
+        Some("playlist")
+    } else {
+        None
+    }
 }
 
 /// Join all run texts in a text node when present, else the simpleText.
@@ -442,5 +675,117 @@ mod tests {
             r#"{"contents":{"sectionListRenderer":{"contents":[{"musicCardShelfRenderer":{"title":"x"}}]}}}"#,
         );
         assert!(collect_list_items(&resp).is_empty());
+    }
+
+    #[test]
+    fn parses_browse_row_from_whole_row_navigation() {
+        let resp = json_of(
+            r#"{
+            "contents": {
+                "tabbedSearchResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "musicShelfRenderer": {
+                                            "contents": [{
+                                                "musicResponsiveListItemRenderer": {
+                                                    "flexColumns": [
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [{"text": "A Night at the Opera"}]
+                                                                }
+                                                            }
+                                                        },
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [{"text": "Album"}, {"text": " • "}, {
+                                                                        "text": "Queen",
+                                                                        "navigationEndpoint": {"browseEndpoint": {"browseId": "UCC9iB8Y-3S5Nq0Jc3rH4VcA"}}
+                                                                    }, {"text": " • "}, {"text": "1975"}]
+                                                                }
+                                                            }
+                                                        }
+                                                    ],
+                                                    "navigationEndpoint": {
+                                                        "browseEndpoint": {
+                                                            "browseEndpointContextSupportedConfigs": {
+                                                                "browseEndpointContextMusicConfig": {
+                                                                    "pageType": "MUSIC_PAGE_TYPE_ALBUM"
+                                                                }
+                                                            },
+                                                            "browseId": "MPREb_abc123DEF456"
+                                                        }
+                                                    }
+                                                }
+                                            }]
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        }"#,
+        );
+        let items = collect_list_items(&resp);
+        let track = parse_browse_row(items[0]).unwrap();
+        assert_eq!(track.title, "A Night at the Opera");
+        assert_eq!(track.browse_id.as_deref(), Some("MPREb_abc123DEF456"));
+        assert_eq!(track.album_id.as_deref(), Some("MPREb_abc123DEF456"));
+        assert_eq!(track.category.as_deref(), Some("album"));
+        assert_eq!(track.artist, "Queen");
+        assert_eq!(track.artist_id.as_deref(), Some("UCC9iB8Y-3S5Nq0Jc3rH4VcA"));
+        assert!(track.key().starts_with("browse:"));
+    }
+
+    #[test]
+    fn browse_row_without_browse_id_is_none() {
+        let resp = json_of(
+            r#"{"contents":{"sectionListRenderer":{"contents":[{"musicResponsiveListItemRenderer":{
+                "flexColumns":[{"musicResponsiveListItemFlexColumnRenderer":{"text":{"runs":[{"text":"x"}]}}}]
+            }}]}}}"#,
+        );
+        let items = collect_list_items(&resp);
+        assert!(parse_browse_row(items[0]).is_none());
+    }
+
+    #[test]
+    fn tab_filtering_keeps_matching_rows() {
+        let album = Track {
+            title: "A".into(),
+            artist: "B".into(),
+            category: Some("album".into()),
+            browse_id: Some("MPREb_1".into()),
+            album_id: Some("MPREb_1".into()),
+            ..Default::default()
+        };
+        let artist = Track {
+            title: "C".into(),
+            artist: "D".into(),
+            category: Some("artist".into()),
+            browse_id: Some("UCx".into()),
+            artist_id: Some("UCx".into()),
+            ..Default::default()
+        };
+        let playlist = Track {
+            title: "E".into(),
+            category: Some("playlist".into()),
+            browse_id: Some("VLPL".into()),
+            ..Default::default()
+        };
+        assert!(tab_matches(SearchTab::Albums, &album));
+        assert!(!tab_matches(SearchTab::Albums, &artist));
+        assert!(!tab_matches(SearchTab::Albums, &playlist));
+        assert!(tab_matches(SearchTab::Artists, &artist));
+        assert!(!tab_matches(SearchTab::Artists, &playlist));
+        assert!(tab_matches(SearchTab::Playlists, &playlist));
+        assert!(!tab_matches(SearchTab::Playlists, &album));
+        assert!(!tab_matches(SearchTab::Songs, &album));
+        assert!(!tab_matches(SearchTab::Songs, &playlist));
     }
 }
