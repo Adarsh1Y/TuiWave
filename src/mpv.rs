@@ -27,6 +27,7 @@ pub struct PlaybackState {
     pub idle: bool,
     pub volume: f64,
     pub media_title: Option<String>,
+    pub paused_for_cache: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +108,7 @@ impl Mpv {
             (4, "idle-active"),
             (5, "volume"),
             (6, "media-title"),
+            (7, "paused-for-cache"),
         ] {
             let _ = handle
                 .command_raw(json!(["observe_property", id, prop]))
@@ -348,6 +350,9 @@ async fn reader_loop(
                     "duration" => s.duration = data.and_then(Value::as_f64),
                     "pause" => s.paused = data.and_then(Value::as_bool).unwrap_or(false),
                     "idle-active" => s.idle = data.and_then(Value::as_bool).unwrap_or(true),
+                    "paused-for-cache" => {
+                        s.paused_for_cache = data.and_then(Value::as_bool).unwrap_or(false)
+                    }
                     "volume" => s.volume = data.and_then(Value::as_f64).unwrap_or(0.0),
                     "media-title" => {
                         s.media_title = data.and_then(Value::as_str).map(str::to_string)

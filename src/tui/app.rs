@@ -13,6 +13,7 @@ use crate::innertube::{SearchTab, StreamFormat};
 use crate::library;
 use crate::model::{Track, TrackSource};
 use crate::mpris::MprisHandle;
+use crate::mpv::PlaybackState;
 use crate::playlists;
 use crate::state::Session;
 
@@ -127,6 +128,16 @@ pub struct App {
     pub(crate) exit_requested: bool,
     mpris: Option<MprisHandle>,
     retry_pending: bool,
+    /// Last time the stream was starved of data (`paused-for-cache`).
+    stall_since: Option<Instant>,
+    /// A stall-recovery re-resolve is already in flight.
+    stall_recovering: bool,
+    /// Times this track's reload attempts failed in a row (bounded to avoid a loop).
+    stall_recover_count: u32,
+    /// Give up auto-recovering until the user picks a new track.
+    stall_gave_up: bool,
+    /// Last observed playback position; freeze detection baseline.
+    last_stall_pos: Option<f64>,
 }
 
 impl App {
@@ -181,6 +192,11 @@ impl App {
             exit_requested: false,
             mpris,
             retry_pending: false,
+            stall_since: None,
+            stall_recovering: false,
+            stall_recover_count: 0,
+            stall_gave_up: false,
+            last_stall_pos: None,
         }
     }
 
@@ -295,7 +311,14 @@ impl App {
                         self.retry_pending = false;
                         self.resume_position = None;
                         self.resume_key = None;
-                        self.show_toast(format!("playback failed: {e}"));
+                        self.stall_recover_count += 1;
+                        if self.stall_recover_count > 2 {
+                            self.stall_gave_up = true;
+                            self.show_toast("stream stalled — giving up");
+                        } else {
+                            self.stall_recovering = false;
+                            self.show_toast(format!("reconnect failed ({e}), retrying…"));
+                        }
                     }
                 }
             }
@@ -362,6 +385,8 @@ impl App {
                 self.next();
             }
             AppEvent::Playback(Event::EndFile { reason }) => {
+                self.stall_recovering = false;
+                self.stall_since = None;
                 match reason.as_str() {
                     "eof" | "end-of-file" => {
                         self.retry_pending = false;
@@ -382,12 +407,29 @@ impl App {
                 }
             }
             AppEvent::Playback(Event::FileLoaded) => {
+                self.stall_recovering = false;
+                self.stall_since = None;
+                self.stall_recover_count = 0;
+                self.stall_gave_up = false;
                 if let Some(pos) = self.resume_position {
                     let want = self.resume_key.clone();
                     let have = self.current.as_ref().map(Track::key);
                     if want.is_none() || want == have {
                         let backend = self.backend.clone();
+                        let state = backend.state();
                         tokio::spawn(async move {
+                            // Wait for mpv to actually start playing (idle=false)
+                            // before seeking. Seeking immediately after FileLoaded
+                            // races the demuxer buffer and can stall the stream.
+                            for _ in 0..40 {
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                let idle = state.read().await.idle;
+                                if !idle {
+                                    break;
+                                }
+                            }
+                            // Small extra delay for demuxer cache to fill
+                            tokio::time::sleep(Duration::from_millis(500)).await;
                             let _ = backend.seek(pos, true).await;
                         });
                     }
@@ -397,6 +439,67 @@ impl App {
             }
             AppEvent::Playback(Event::StateChanged) => {}
         }
+    }
+
+    /// Watchdog for a stalled stream. Called every UI tick: when playback is
+    /// active (`!paused`, `!idle`) but the position has not advanced for a few
+    /// ticks, the stream has died. Re-resolve the URL and reload, resuming at
+    /// the frozen position.
+    pub fn check_stall(&mut self, playback: &PlaybackState) {
+        if !self.backend.is_mpv() {
+            return;
+        }
+        if self.current.is_none() || self.stall_recovering || self.stall_gave_up || self.retry_pending {
+            self.last_stall_pos = None;
+            self.stall_since = None;
+            return;
+        }
+        if playback.paused || playback.idle {
+            self.last_stall_pos = None;
+            self.stall_since = None;
+            return;
+        }
+        // Only care once playback has actually advanced off zero.
+        let Some(pos) = playback.time_pos else {
+            return;
+        };
+        if pos > 0.0 && self.last_stall_pos != Some(pos) {
+            self.last_stall_pos = Some(pos);
+            self.stall_since = None;
+            return;
+        }
+        // Position frozen. Give it a grace period (brief cache re-buffer)
+        // before declaring a stall.
+        match self.stall_since {
+            Some(at) if at.elapsed() > Duration::from_secs(5) => {
+                self.recover_stalled_stream(pos);
+            }
+            Some(_) => {}
+            None => self.stall_since = Some(std::time::Instant::now()),
+        }
+    }
+
+    /// Re-resolve the current stream and reload it, seeking back to `pos`.
+    fn recover_stalled_stream(&mut self, pos: f64) {
+        let Some(track) = self.current.clone() else {
+            return;
+        };
+        self.stall_recovering = true;
+        self.resume_position = Some(pos);
+        self.resume_key = Some(track.key());
+        self.show_toast("stream stalled — reconnecting…");
+        let tx = self.events.clone();
+        let id = track.video_id.clone();
+        let codec = self.cfg.codec;
+        tokio::spawn(async move {
+            let mut cfg = innertube::config::scrape().await;
+            let client = innertube::http_client();
+            let result = innertube::resolve_stream(&client, &mut cfg, &id, codec).await;
+            let _ = tx.send(AppEvent::StreamResolved {
+                track,
+                result: result.map_err(|e| e.to_string()),
+            });
+        });
     }
 
     pub fn start_search_seq(&mut self, query: String) {
@@ -497,6 +600,10 @@ impl App {
         let Some(track) = self.queue.get(self.cursor).cloned() else {
             return;
         };
+        self.stall_recover_count = 0;
+        self.stall_since = None;
+        self.stall_recovering = false;
+        self.stall_gave_up = false;
         self.record_history(&track);
         self.current = Some(track.clone());
         self.current_art = None;

@@ -236,10 +236,13 @@ pub async fn run(
                     app_state.toast = None;
                 }
                 tick_count += 1;
+                let playback = app_state.backend.state().read().await.clone();
                 if tick_count.is_multiple_of(40) {
-                    let playback = app_state.backend.state().read().await.clone();
                     app_state.persist_session(&playback);
                 }
+                // Detect stalled streams so the URL can be re-resolved and the
+                // stream reloaded instead of hanging forever.
+                app_state.check_stall(&playback);
             }
         }
     }
