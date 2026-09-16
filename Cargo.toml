@@ -1,6 +1,6 @@
 [package]
 name = "lastwave"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 description = "A LastWave-inspired YouTube Music TUI player for Linux"
 license = "MIT"
