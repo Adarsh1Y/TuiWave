@@ -517,6 +517,109 @@ impl App {
         self.show_toast(label);
     }
 
+    /// MPRIS view of the current playback/queue state.
+    pub fn mpris_state(&self, playback: &crate::mpv::PlaybackState) -> crate::mpris::MprisState {
+        use crate::mpris::{LoopStatus, MprisState, PlaybackStatus};
+
+        let status = if self.current.is_none() || playback.idle {
+            PlaybackStatus::Stopped
+        } else if playback.paused {
+            PlaybackStatus::Paused
+        } else {
+            PlaybackStatus::Playing
+        };
+
+        let length_us = playback
+            .duration
+            .or_else(|| self.current.as_ref().and_then(|t| t.duration.map(f64::from)))
+            .map(|secs| (secs * 1_000_000.0) as i64);
+
+        let current = self.current.as_ref();
+        let has_track = current.is_some();
+        let at_start = self.cursor == 0;
+        let at_end = self.queue.len().saturating_sub(1) <= self.cursor;
+
+        MprisState {
+            title: current.map(|t| t.title.clone()),
+            artist: current.and_then(|t| {
+                if t.artist.is_empty() {
+                    None
+                } else {
+                    Some(t.artist.clone())
+                }
+            }),
+            album: current.and_then(|t| t.album.clone()),
+            art_url: current.and_then(|t| t.thumbnail_url.clone()),
+            length_us,
+            track_id: current.map(|t| t.key()),
+            status,
+            loop_status: match self.repeat {
+                RepeatMode::Off => LoopStatus::None,
+                RepeatMode::All => LoopStatus::Playlist,
+                RepeatMode::One => LoopStatus::Track,
+            },
+            shuffle: self.shuffle,
+            volume: (playback.volume / 100.0).clamp(0.0, 1.0),
+            can_go_next: has_track
+                && (!at_end || self.repeat == RepeatMode::All || self.shuffle),
+            can_go_previous: has_track
+                && (!at_start || self.repeat == RepeatMode::All),
+            can_play: has_track,
+            can_pause: has_track,
+            can_seek: has_track,
+        }
+    }
+
+    /// Apply a control requested over MPRIS.
+    pub async fn handle_mpris(&mut self, control: crate::mpris::Control) -> Result<()> {
+        use crate::mpris::{Control, LoopStatus};
+        match control {
+            Control::Next => self.next(),
+            Control::Previous => self.prev(),
+            Control::PlayPause => self.backend.play_pause().await?,
+            Control::Play => {
+                if self.backend.state().read().await.paused {
+                    self.backend.play_pause().await?;
+                }
+            }
+            Control::Pause => {
+                if !self.backend.state().read().await.paused {
+                    self.backend.play_pause().await?;
+                }
+            }
+            Control::Stop => {
+                self.backend.seek(0.0, true).await?;
+                if !self.backend.state().read().await.paused {
+                    self.backend.play_pause().await?;
+                }
+            }
+            Control::Seek(offset) => {
+                self.backend
+                    .seek(offset as f64 / 1_000_000.0, false)
+                    .await?;
+            }
+            Control::SetPosition(position) => {
+                self.backend
+                    .seek(position as f64 / 1_000_000.0, true)
+                    .await?;
+            }
+            Control::SetVolume(volume) => {
+                self.backend
+                    .set_volume((volume * 100.0).clamp(0.0, 150.0))
+                    .await?;
+            }
+            Control::SetShuffle(shuffle) => self.shuffle = shuffle,
+            Control::SetLoop(status) => {
+                self.repeat = match status {
+                    LoopStatus::None => RepeatMode::Off,
+                    LoopStatus::Playlist => RepeatMode::All,
+                    LoopStatus::Track => RepeatMode::One,
+                };
+            }
+        }
+        Ok(())
+    }
+
     /// Toggle the active EQ preset on/off. Requires mpv's `af` filter.
     pub async fn toggle_eq(&mut self) -> Result<()> {
         if !self.backend.supports_eq() {

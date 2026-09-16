@@ -49,6 +49,8 @@ pub async fn run(
     let mut app_state = app::App::new(cfg.clone(), backend, app_tx);
     let mut error = None;
 
+    let (mpris, mut mpris_rx) = crate::mpris::spawn();
+
     if resume
         && let Some(session) = crate::state::Session::load()
     {
@@ -74,10 +76,9 @@ pub async fn run(
 
     loop {
         {
-            let snapshot = {
-                let playback = app_state.backend.state().read().await.clone();
-                app_state.snapshot_state(playback)
-            };
+            let playback = app_state.backend.state().read().await.clone();
+            mpris.update(app_state.mpris_state(&playback)).await;
+            let snapshot = app_state.snapshot_state(playback);
             terminal.draw(|f| view::draw(f, &snapshot, app_state.mode))?;
 
             if app_state.mode == app::Mode::Search || app_state.mode == app::Mode::Prompt {
@@ -111,6 +112,14 @@ pub async fn run(
             ev = app_rx.recv() => {
                 if let Some(ev) = ev {
                     app_state.handle_event(ev);
+                }
+            }
+            ctrl = mpris_rx.recv() => {
+                if let Some(ctrl) = ctrl
+                    && let Err(e) = app_state.handle_mpris(ctrl).await
+                {
+                    error = Some(e);
+                    break;
                 }
             }
             ev = backend_events.recv() => {

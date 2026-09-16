@@ -5,6 +5,7 @@ pub mod innertube;
 pub mod library;
 pub mod model;
 pub mod mpd;
+pub mod mpris;
 pub mod mpv;
 pub mod playlists;
 pub mod state;
