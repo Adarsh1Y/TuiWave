@@ -5,7 +5,7 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tokio::sync::mpsc;
 
-use crate::art::Art;
+use crate::art::{Art, ArtRender, KittyImage, register_kitty};
 use crate::backend::{Backend, Event};
 use crate::config::Config;
 use crate::innertube;
@@ -58,7 +58,7 @@ pub enum AppEvent {
     },
     Art {
         track_video_id: String,
-        art: Option<Art>,
+        art: Option<ArtRender>,
     },
     BrowseLoaded {
         label: String,
@@ -87,7 +87,7 @@ pub struct App {
     pub queue: VecDeque<Track>,
     pub cursor: usize,
     pub current: Option<Track>,
-    pub current_art: Option<Art>,
+    pub current_art: Option<ArtRender>,
     pub current_codec: Option<String>,
     pub shuffle: bool,
     pub repeat: RepeatMode,
@@ -97,6 +97,12 @@ pub struct App {
     pub backend: Backend,
     pub events: mpsc::UnboundedSender<AppEvent>,
     search_seq: u64,
+    auto_play: bool,
+    /// Render artwork through the kitty graphics protocol when true.
+    pub kitty: bool,
+    /// Terminal cell size in pixels (kitty), for aspect-correct art sizing.
+    pub cell_w: f64,
+    pub cell_h: f64,
 
     pub liked: Vec<Track>,
     pub playlist_names: Vec<String>,
@@ -115,7 +121,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cfg: Config, backend: Backend, events: mpsc::UnboundedSender<AppEvent>) -> Self {
+    pub fn new(
+        cfg: Config,
+        backend: Backend,
+        events: mpsc::UnboundedSender<AppEvent>,
+        kitty: bool,
+        cell_w: f64,
+        cell_h: f64,
+    ) -> Self {
         let liked = playlists::load_liked().unwrap_or_default();
         Self {
             cfg,
@@ -136,6 +149,10 @@ impl App {
             backend,
             events,
             search_seq: 0,
+            auto_play: false,
+            kitty,
+            cell_w,
+            cell_h,
             liked,
             playlist_names: playlists::list_playlists().unwrap_or_default(),
             playlist_cursor: 0,
@@ -229,6 +246,10 @@ impl App {
                         } else {
                             self.results.clear();
                             self.show_toast("no results");
+                        }
+                        if self.auto_play {
+                            self.auto_play = false;
+                            self.auto_play_first();
                         }
                     }
                     Err(e) => self.show_toast(format!("search failed: {e}")),
@@ -373,6 +394,45 @@ impl App {
                 result: result.map_err(|e| e.to_string()),
             });
         });
+    }
+
+    /// `--play` argument handling: a local file plays directly, anything else
+    /// is searched and the first playable result starts automatically.
+    pub fn play_cli_arg(&mut self, arg: &str) {
+        let path = std::path::Path::new(arg);
+        if path.is_file() {
+            let track = Track {
+                title: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| arg.to_owned()),
+                source: TrackSource::LocalFile(path.to_path_buf()),
+                ..Track::default()
+            };
+            self.queue.clear();
+            self.queue.push_back(track);
+            self.cursor = 0;
+            self.mode = Mode::NowPlaying;
+            self.play_current();
+            return;
+        }
+        self.auto_play = true;
+        self.start_search_seq(arg.to_owned());
+    }
+
+    /// Play the first row that is actually playable (skips album/artist cards).
+    fn auto_play_first(&mut self) {
+        if let Some(i) = self
+            .results
+            .iter()
+            .position(|t| t.browse_id.is_none() && !t.video_id.is_empty())
+        {
+            self.selected = i;
+            self.play_selection();
+        } else if !self.results.is_empty() {
+            self.selected = 0;
+            self.play_selection();
+        }
     }
 
     pub fn play_selection(&mut self) {
@@ -851,11 +911,26 @@ impl App {
 
     fn fetch_art_async(&mut self, track: &Track) {
         let cfg = self.cfg.clone();
+        let kitty = self.kitty;
         let tx = self.events.clone();
         let video_id = track.video_id.clone();
         let track = track.clone();
         tokio::spawn(async move {
-            let art = Art::load(&cfg, &track, 22, 11).await.ok().flatten();
+            let art = if kitty {
+                match KittyImage::load(&cfg, &track).await {
+                    Ok(Some(img)) => {
+                        register_kitty(&img);
+                        Some(ArtRender::Kitty(img))
+                    }
+                    _ => None,
+                }
+            } else {
+                Art::load(&cfg, &track, 22, 11)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(ArtRender::Half)
+            };
             let _ = tx.send(AppEvent::Art {
                 track_video_id: video_id,
                 art,
@@ -1308,6 +1383,9 @@ impl App {
             cursor: self.cursor,
             current: self.current.clone(),
             art: self.current_art.clone(),
+            kitty: self.kitty,
+            cell_w: self.cell_w,
+            cell_h: self.cell_h,
             current_codec: self.current_codec.clone(),
             shuffle: self.shuffle,
             repeat: self.repeat,
@@ -1394,7 +1472,10 @@ pub struct ViewData {
     pub queue: Vec<Track>,
     pub cursor: usize,
     pub current: Option<Track>,
-    pub art: Option<Art>,
+    pub art: Option<ArtRender>,
+    pub kitty: bool,
+    pub cell_w: f64,
+    pub cell_h: f64,
     pub current_codec: Option<String>,
     pub shuffle: bool,
     pub repeat: RepeatMode,

@@ -104,7 +104,7 @@ impl Mpv {
             (1, "time-pos"),
             (2, "duration"),
             (3, "pause"),
-            (4, "idle"),
+            (4, "idle-active"),
             (5, "volume"),
             (6, "media-title"),
         ] {

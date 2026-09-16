@@ -24,6 +24,10 @@ struct Args {
     /// Start fresh, ignoring any saved session.
     #[arg(long, conflicts_with = "resume")]
     no_resume: bool,
+
+    /// Start and play a local file or search query immediately.
+    #[arg(long)]
+    play: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -36,7 +40,7 @@ fn main() -> Result<()> {
     if let Some(p) = args.mpv_path {
         cfg.mpv_path = p;
     }
-    let resume = if args.no_resume {
+    let resume = if args.play.is_some() || args.no_resume {
         false
     } else if args.resume {
         true
@@ -55,6 +59,6 @@ fn main() -> Result<()> {
         {
             let _ = backend_engine.set_af(&chain).await;
         }
-        tui::run(&cfg, backend_engine, backend_events, resume).await
+        tui::run(&cfg, backend_engine, backend_events, resume, args.play).await
     })
 }

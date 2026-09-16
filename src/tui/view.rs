@@ -4,30 +4,64 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 
-use crate::art;
+use crate::art::{self, ArtRender};
 use crate::tui::app::{Mode, PromptKind, RepeatMode, ViewData};
 
 const HIGHLIGHT: Color = Color::Rgb(40, 44, 52);
+
+/// A request to paint a kitty image over the terminal at a cell rect.
+#[derive(Debug, Clone)]
+pub struct ArtBlit {
+    pub cell: Rect,
+    pub key: String,
+    pub width: u32,
+    pub height: u32,
+}
 
 fn footer<'a>(text: &'a str) -> Paragraph<'a> {
     Paragraph::new(text).style(Style::default().fg(Color::DarkGray))
 }
 
-pub fn draw(frame: &mut Frame, data: &ViewData, mode: Mode) {
-    match mode {
-        Mode::Search => draw_search(frame, data),
+pub fn draw(frame: &mut Frame, data: &ViewData, mode: Mode) -> Option<ArtBlit> {
+    let blit = match mode {
+        Mode::Search => {
+            draw_search(frame, data);
+            None
+        }
         Mode::NowPlaying => draw_now_playing(frame, data),
-        Mode::Queue => draw_queue(frame, data),
-        Mode::Help => draw_help(frame),
-        Mode::Prompt => draw_prompt(frame, data),
-        Mode::Playlists => draw_playlists(frame, data),
-        Mode::PlaylistDetail => draw_playlist_detail(frame, data),
-        Mode::Local => draw_local(frame, data),
-        Mode::History => draw_history(frame, data),
-    }
+        Mode::Queue => {
+            draw_queue(frame, data);
+            None
+        }
+        Mode::Help => {
+            draw_help(frame);
+            None
+        }
+        Mode::Prompt => {
+            draw_prompt(frame, data);
+            None
+        }
+        Mode::Playlists => {
+            draw_playlists(frame, data);
+            None
+        }
+        Mode::PlaylistDetail => {
+            draw_playlist_detail(frame, data);
+            None
+        }
+        Mode::Local => {
+            draw_local(frame, data);
+            None
+        }
+        Mode::History => {
+            draw_history(frame, data);
+            None
+        }
+    };
     if let Some(toast) = &data.toast {
         draw_toast(frame, toast);
     }
+    blit
 }
 
 fn heart(track_liked: bool) -> &'static str {
@@ -170,7 +204,7 @@ fn tab_index(tab: crate::innertube::SearchTab) -> usize {
     }
 }
 
-fn draw_now_playing(frame: &mut Frame, data: &ViewData) {
+fn draw_now_playing(frame: &mut Frame, data: &ViewData) -> Option<ArtBlit> {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -192,7 +226,7 @@ fn draw_now_playing(frame: &mut Frame, data: &ViewData) {
                 .alignment(Alignment::Center),
             outer[0],
         );
-        return;
+        return None;
     };
     let state = &data.playback;
 
@@ -274,7 +308,7 @@ fn draw_now_playing(frame: &mut Frame, data: &ViewData) {
     line.push(Span::raw(if data.radio { " 📻" } else { "" }));
     frame.render_widget(Paragraph::new(Line::from(line)), outer[1]);
 
-    render_art_area(frame, inner[1], data);
+    render_art_area(frame, inner[1], data)
 }
 
 fn draw_queue(frame: &mut Frame, data: &ViewData) {
@@ -677,28 +711,56 @@ fn progress(state: &crate::mpv::PlaybackState) -> Gauge<'static> {
         .gauge_style(Style::default().fg(Color::Green).bg(Color::Rgb(30, 30, 30)))
 }
 
-fn render_art_area(frame: &mut Frame, area: Rect, data: &ViewData) {
+fn render_art_area(frame: &mut Frame, area: Rect, data: &ViewData) -> Option<ArtBlit> {
     let art_area = Rect {
         x: area.x + 1,
         y: area.y + 1,
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
-    if let Some(art) = &data.art {
-        let bounded = Rect {
-            width: art.cols.min(art_area.width),
-            height: art.rows.min(art_area.height),
-            ..art_area
-        };
-        frame.render_widget(Clear, bounded);
-        art::render_into(frame.buffer_mut(), bounded, art);
-    } else {
-        frame.render_widget(
-            Paragraph::new(" no cover ")
-                .style(Style::default().fg(Color::DarkGray))
-                .alignment(Alignment::Center),
-            art_area,
-        );
+    match &data.art {
+        Some(ArtRender::Half(art)) => {
+            let bounded = Rect {
+                width: art.cols.min(art_area.width),
+                height: art.rows.min(art_area.height),
+                ..art_area
+            };
+            frame.render_widget(Clear, bounded);
+            art::render_into(frame.buffer_mut(), bounded, art);
+            None
+        }
+        Some(ArtRender::Kitty(img)) if data.kitty => {
+            // Leave the space blank in the cell buffer; the kitty image is
+            // placed on top by the caller after the frame is flushed. The rect
+            // keeps the image's aspect ratio at the current cell proportions.
+            let aspect = img.width as f64 / img.height.max(1) as f64;
+            let cell_w = data.cell_w.max(0.001);
+            let cell_h = data.cell_h.max(0.001);
+            let rows = art_area.height.clamp(1, art_area.height);
+            let pixel_h = rows as f64 * cell_h;
+            let cells_w = ((pixel_h * aspect / cell_w).round() as u16).clamp(1, art_area.width);
+            let bounded = Rect {
+                width: cells_w,
+                height: rows,
+                ..art_area
+            };
+            frame.render_widget(Clear, bounded);
+            Some(ArtBlit {
+                cell: bounded,
+                key: img.key.clone(),
+                width: img.width,
+                height: img.height,
+            })
+        }
+        _ => {
+            frame.render_widget(
+                Paragraph::new(" no cover ")
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(Alignment::Center),
+                art_area,
+            );
+            None
+        }
     }
 }
 

@@ -1204,6 +1204,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures",
+ "hex",
  "image",
  "ratatui",
  "reqwest",
