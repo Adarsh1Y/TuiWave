@@ -1,0 +1,10 @@
+# fish completion for lastwave
+# Usage: source completions/_lastwave
+
+complete -c lastwave -s v -l volume -d "Start volume (0-150), overrides config" -x -a "0 1 2 3 4 5 6 7 8 9 10 25 50 75 100 150"
+complete -c lastwave -l mpv-path -d "Path to the mpv binary" -r -F
+complete -c lastwave -l resume -d "Restore the previous session on start"
+complete -c lastwave -l no-resume -d "Start fresh, ignoring any saved session"
+complete -c lastwave -l play -d "Play a local file or search query immediately" -r -F
+complete -c lastwave -s h -l help -d "Print help"
+complete -c lastwave -s V -l version -d "Print version"

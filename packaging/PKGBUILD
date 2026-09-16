@@ -1,0 +1,40 @@
+# Maintainer: Adarsh1Y <adarsh@example.invalid>
+# PKGBUILD for lastwave, a LastWave-inspired YouTube Music TUI player.
+#
+# The source tarball is the GitHub release archive. shasum/source are filled
+# automatically by scripts/release.sh (or manually with `updpkgsums` after a
+# tag push).
+
+pkgname=lastwave
+pkgver=0.5.0
+pkgrel=1
+pkgdesc="A LastWave-inspired YouTube Music TUI player for Linux"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Adarsh1Y/TuiWave"
+license=('MIT')
+depends=('mpv')
+optdepends=('yt-dlp: fallback stream resolver')
+makedepends=('rust' 'cargo' 'cc')
+source=("https://github.com/Adarsh1Y/TuiWave/archive/v${pkgver}.tar.gz")
+# Filled in by scripts/release.sh once the v${pkgver} tag exists.
+sha256sums=('SKIP')
+
+build() {
+    cd "$srcdir/TuiWave-${pkgver}"
+    cargo build --release --locked
+}
+
+check() {
+    cd "$srcdir/TuiWave-${pkgver}"
+    cargo test --locked --release
+}
+
+package() {
+    cd "$srcdir/TuiWave-${pkgver}"
+    install -Dm755 target/release/lastwave "$pkgdir/usr/bin/lastwave"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/${pkgname}/LICENSE"
+    gzip -9c man/lastwave.1 > "$pkgdir/usr/share/man/man1/lastwave.1.gz"
+    install -Dm644 completions/lastwave.bash "$pkgdir/usr/share/bash-completion/completions/lastwave"
+    install -Dm644 completions/lastwave.zsh "$pkgdir/usr/share/zsh/site-functions/_lastwave"
+    install -Dm644 completions/_lastwave "$pkgdir/usr/share/fish/vendor_completions.d/lastwave.fish"
+}

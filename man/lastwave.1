@@ -1,0 +1,179 @@
+.TH LASTWAVE 1 "September 2026" "lastwave 0.5.0" "User Commands"
+.SH NAME
+lastwave \- LastWave-inspired YouTube Music TUI player for Linux
+.SH SYNOPSIS
+.B lastwave
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+.B lastwave
+is a terminal user interface for YouTube Music and local audio. It searches
+YouTube Music directly through the public InnerTube API, resolves audio streams
+without a browser or cookies, and plays them through
+.BR mpv (1).
+It supports a local file library, playlists, a deep-bass EQ preset, persistent
+session resume, MPRIS desktop integration, and full-screen terminal album art
+(half-block rendering, or the kitty graphics protocol when running under
+kitty).
+.SH OPTIONS
+.TP
+.BR \-v ", " \-\-volume " " \fIVOLUME\fR
+Start volume (0\(en150), overrides the value in the configuration file.
+.TP
+.B \-\-mpv\-path \fIPATH\fR
+Path to the
+.B mpv
+binary to use for playback.
+.TP
+.B \-\-resume
+Restore the previous session (queue, position, history) on startup. The default
+is controlled by the
+.B resume
+configuration option.
+.TP
+.B \-\-no\-resume
+Start fresh, ignoring any saved session. Mutually exclusive with
+.BR \-\-resume .
+.TP
+.B \-\-play \fIARG\fR
+Start playback immediately. If
+.I ARG
+is an existing local file path it is enqueued and played directly; otherwise it
+is treated as a search query and the first playable result is autoplayed.
+Implies
+.BR \-\-no\-resume .
+.TP
+.BR \-h ", " \-\-help
+Print help and exit.
+.TP
+.BR \-V ", " \-\-version
+Print version information and exit.
+.SH CONFIGURATION
+The configuration file
+.B $XDG_CONFIG_HOME/lastwave/config.toml
+(typically
+.BR ~/.config/lastwave/config.toml )
+is created with default values on first run. Supported keys:
+.TP
+.B volume
+Start volume for mpv, 0\(en150 (integer).
+.TP
+.B mpv_path
+Path to the mpv binary (string).
+.TP
+.B cache_dir
+Directory for cached album art (string path).
+.TP
+.B autoplay
+Autoplay the next track when the current one ends (boolean).
+.TP
+.B codec
+Preferred audio codec: "best", "opus", or "aac" (string).
+.TP
+.B local_dirs
+List of directories scanned for local audio files (array of paths).
+.TP
+.B resume
+Restore the previous queue/position/history on startup (boolean, default true).
+.TP
+.B backend
+Playback engine: "mpv" (default) or "mpd" (string).
+.TP
+.B mpd.socket
+[mpd] Unix socket path, or mpd.host/mpd.port for a network daemon (string).
+.TP
+.B mpd.host, mpd.port, mpd.password
+[mpd] MPD connection settings (string/integer/string).
+.TP
+.B eq
+[eq] Equalizer settings; see presets in the generated file.
+.SH FILES
+.TP
+.B ~/.config/lastwave/config.toml
+Configuration file.
+.TP
+.B ~/.config/lastwave/session.json
+Saved session state (queue, search history, playback position).
+.TP
+.B ~/.cache/lastwave/art
+Cached album art thumbnails.
+.TP
+.B ~/.config/lastwave/playlists
+Saved playlists.
+.TP
+.B ~/.config/lastwave/lastwave.lock
+Single-instance lock file (removed on clean exit).
+.SH ENVIRONMENT
+.TP
+.B KITTY_WINDOW_ID, TERM
+When running under kitty (or when TERM is "xterm-kitty"), album art is rendered
+using the kitty graphics protocol. Otherwise half-block art is used.
+.TP
+.B XDG_CONFIG_HOME, XDG_CACHE_HOME
+Base directories for configuration and cache files.
+.SH KEYS
+.TP
+.B q
+Quit.
+.TP
+.B ? 
+Help/key map overlay.
+.TP
+.B / and s
+Search.
+.TP
+.B Alt+l
+Like/unlike the current track.
+.TP
+.B Alt+P
+Manage playlists.
+.TP
+.B Alt+o, Alt+t
+Queue view / add to queue.
+.TP
+.B Alt+u
+Local file library browser.
+.TP
+.B Alt+n, Alt+p, Alt+e, Alt+x
+Next track, previous track, EQ toggle, EQ panel.
+.TP
+.B Alt+r, Alt+z
+Repeat mode, shuffle.
+.TP
+.B Alt+g
+Go to artist/album of the current track.
+.TP
+.B Alt+a
+Cycle mpv audio output device.
+.TP
+.B Alt+R
+Start a radio from the current selection.
+.TP
+.B Alt+h
+Search history.
+.TP
+.B space, j/k, Enter, Esc, Tab
+Play/pause, navigation, select, back, cycle focus. Most other letters type
+into the active input field.
+.SH EXAMPLES
+.TP
+launch the player
+.B lastwave
+.TP
+play a local file immediately
+.B lastwave --play ~/Music/album.flac
+.TP
+search and autoplay
+.B lastwave --play "Tame Impala The Less I Know The Better"
+.TP
+start at 80% volume without resuming
+.B lastwave --volume 80 --no-resume
+.SH EXIT STATUS
+.B lastwave
+exits 0 on success and nonzero on error (for example a missing mpv binary or an
+unusable configuration file).
+.SH SEE ALSO
+.BR mpv (1),
+.BR playerctl (1)
+.PP
+The full manual, key map, and configuration reference are available in the
+project README.

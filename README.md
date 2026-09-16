@@ -26,8 +26,13 @@ full-screen terminal album art — all without the YouTube web player.
 - **Resilient playback** — a dead/stalled stream is re-resolved once and, if it
   fails again, playback moves on to the next track.
 - **Song-only search** — video and episode results are filtered out of search.
-- **Terminal album art** — rasterised, half-block art rendered from the track
-  thumbnail, cached under `~/.cache/lastwave/art`.
+- **Terminal album art** — half-block art rendered from the track thumbnail,
+  with full-resolution kitty graphics when running under kitty; cached under
+  `~/.cache/lastwave/art`.
+- **MPRIS integration** — exposes an MPRIS2 media player service so external
+  remotes (`playerctl`, media keys, desktop shells) can control playback.
+- **`--play`** — start a local file or a search autoplay straight from the
+  command line.
 - **Persistent search history** and an autoplaying queue with shuffle/repeat.
 
 ## Dependencies
@@ -88,6 +93,24 @@ cargo build --release
 sudo install -m755 target/release/lastwave /usr/local/bin/lastwave
 ```
 
+### Arch Linux (PKGBUILD)
+
+```sh
+git clone https://github.com/Adarsh1Y/TuiWave
+cd TuiWave
+makepkg -si            # from packaging/PKGBUILD
+```
+
+The package installs the binary, the `lastwave(1)` man page, an MIT license,
+and shell completions for bash, zsh, and fish.
+
+### Man page and completions
+
+- Man page: `man/lastwave.1` — also shown via `man lastwave` after installation.
+- Completions: `completions/lastwave.bash`, `completions/lastwave.zsh`, and
+  `completions/_lastwave` (fish). Source them directly or copy them into your
+  shell's completion directory.
+
 ### Verify
 
 ```sh
@@ -100,11 +123,17 @@ lastwave --version
 Usage: lastwave [OPTIONS]
 
 Options:
-  -v, --volume <VOLUME>    Start volume (0-150), overrides config
+  -v, --volume <VOLUME>      Start volume (0-150), overrides config
       --mpv-path <MPV_PATH>  Path to the mpv binary
-  -h, --help               Print help
-  -V, --version            Print version
+      --resume               Restore the previous session on start
+      --no-resume            Start fresh, ignoring any saved session
+      --play <ARG>           Play a local file or search query immediately
+  -h, --help                 Print help
+  -V, --version              Print version
 ```
+
+`--play` plays an existing local file path directly, or treats `ARG` as a
+search query and autoplays the first playable result.
 
 ### First run
 
