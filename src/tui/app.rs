@@ -12,6 +12,7 @@ use crate::innertube;
 use crate::innertube::{SearchTab, StreamFormat};
 use crate::library;
 use crate::model::{Track, TrackSource};
+use crate::mpris::MprisHandle;
 use crate::playlists;
 use crate::state::Session;
 
@@ -117,6 +118,14 @@ pub struct App {
     pub history_cursor: usize,
     pub last_query: String,
     resume_position: Option<f64>,
+    /// Track key the resume seek belongs to; prevents seeking the wrong file.
+    resume_key: Option<String>,
+    /// Queue-mode highlight, independent of the playback cursor so that
+    /// browsing the queue doesn't re-target auto-advance.
+    queue_sel: usize,
+    /// Set when an external MPRIS client asked the player to quit.
+    pub(crate) exit_requested: bool,
+    mpris: Option<MprisHandle>,
     retry_pending: bool,
 }
 
@@ -125,6 +134,7 @@ impl App {
         cfg: Config,
         backend: Backend,
         events: mpsc::UnboundedSender<AppEvent>,
+        mpris: Option<MprisHandle>,
         kitty: bool,
         cell_w: f64,
         cell_h: f64,
@@ -166,6 +176,10 @@ impl App {
             history_cursor: 0,
             last_query: String::new(),
             resume_position: None,
+            resume_key: None,
+            queue_sel: 0,
+            exit_requested: false,
+            mpris,
             retry_pending: false,
         }
     }
@@ -209,7 +223,7 @@ impl App {
                 }
             }
             Mode::Queue => {
-                if let Some(t) = self.queue.get(self.cursor).cloned() {
+                if let Some(t) = self.queue.get(self.queue_sel).cloned() {
                     self.toggle_like(&t);
                 }
             }
@@ -261,6 +275,7 @@ impl App {
                 }
                 match result {
                     Ok(stream) => {
+                        self.retry_pending = false;
                         self.current_codec = Some(stream.display());
                         let title = format!("{} - {}", track.artist, track.title);
                         let url = stream.url.clone();
@@ -278,6 +293,8 @@ impl App {
                     }
                     Err(e) => {
                         self.retry_pending = false;
+                        self.resume_position = None;
+                        self.resume_key = None;
                         self.show_toast(format!("playback failed: {e}"));
                     }
                 }
@@ -365,12 +382,18 @@ impl App {
                 }
             }
             AppEvent::Playback(Event::FileLoaded) => {
-                if let Some(pos) = self.resume_position.take() {
-                    let backend = self.backend.clone();
-                    tokio::spawn(async move {
-                        let _ = backend.seek(pos, true).await;
-                    });
+                if let Some(pos) = self.resume_position {
+                    let want = self.resume_key.clone();
+                    let have = self.current.as_ref().map(Track::key);
+                    if want.is_none() || want == have {
+                        let backend = self.backend.clone();
+                        tokio::spawn(async move {
+                            let _ = backend.seek(pos, true).await;
+                        });
+                    }
                 }
+                self.resume_position = None;
+                self.resume_key = None;
             }
             AppEvent::Playback(Event::StateChanged) => {}
         }
@@ -464,6 +487,12 @@ impl App {
         self.play_current();
     }
 
+    /// Show the queue; start the highlight on the currently playing track.
+    pub fn enter_queue(&mut self) {
+        self.queue_sel = self.cursor.min(self.queue.len().saturating_sub(1));
+        self.mode = Mode::Queue;
+    }
+
     pub fn play_current(&mut self) {
         let Some(track) = self.queue.get(self.cursor).cloned() else {
             return;
@@ -508,10 +537,17 @@ impl App {
         if self.queue.is_empty() {
             return;
         }
-        if self.shuffle && self.cursor + 1 < self.queue.len() {
-            let remaining = self.cursor + 1;
-            let n = self.queue.len() - remaining;
-            self.cursor = remaining + (fast_rng() as usize % n);
+        if self.shuffle {
+            if self.cursor + 1 < self.queue.len() {
+                let remaining = self.cursor + 1;
+                let n = self.queue.len() - remaining;
+                self.cursor = remaining + (fast_rng() as usize % n);
+            } else if self.repeat == RepeatMode::All {
+                let n = self.queue.len();
+                self.cursor = fast_rng() as usize % n;
+            } else {
+                return;
+            }
         } else if self.cursor + 1 < self.queue.len() {
             self.cursor += 1;
         } else if self.repeat == RepeatMode::All {
@@ -620,8 +656,8 @@ impl App {
             },
             shuffle: self.shuffle,
             volume: (playback.volume / 100.0).clamp(0.0, 1.0),
-            can_go_next: has_track
-                && (!at_end || self.repeat == RepeatMode::All || self.shuffle),
+            position_us: playback.time_pos.map(|s| (s * 1_000_000.0) as i64).unwrap_or(0),
+            can_go_next: has_track && (!at_end || self.repeat == RepeatMode::All),
             can_go_previous: has_track
                 && (!at_start || self.repeat == RepeatMode::All),
             can_play: has_track,
@@ -630,15 +666,24 @@ impl App {
         }
     }
 
-    /// Apply a control requested over MPRIS.
+    /// Apply a control requested over MPRIS. Errors are surfaced to the caller
+    /// (which shows them as a toast) but never terminate the app.
     pub async fn handle_mpris(&mut self, control: crate::mpris::Control) -> Result<()> {
         use crate::mpris::{Control, LoopStatus};
         match control {
             Control::Next => self.next(),
             Control::Previous => self.prev(),
-            Control::PlayPause => self.backend.play_pause().await?,
+            Control::PlayPause => {
+                if self.current.is_none() {
+                    self.play_current();
+                } else {
+                    self.backend.play_pause().await?;
+                }
+            }
             Control::Play => {
-                if self.backend.state().read().await.paused {
+                if self.current.is_none() {
+                    self.play_current();
+                } else if self.backend.state().read().await.paused {
                     self.backend.play_pause().await?;
                 }
             }
@@ -652,18 +697,31 @@ impl App {
                 if !self.backend.state().read().await.paused {
                     self.backend.play_pause().await?;
                 }
+                self.current = None;
+                self.current_art = None;
+                self.current_codec = None;
             }
             Control::Seek(offset) => {
-                self.backend
-                    .seek(offset as f64 / 1_000_000.0, false)
-                    .await?;
+                let current_pos = self.backend.state().read().await.time_pos;
+                let target = current_pos.unwrap_or(0.0) + offset as f64 / 1_000_000.0;
+                if !target.is_finite() {
+                    return Ok(());
+                }
+                self.backend.seek(target.max(0.0), true).await?;
+                self.note_seek(target.max(0.0)).await;
             }
             Control::SetPosition(position) => {
-                self.backend
-                    .seek(position as f64 / 1_000_000.0, true)
-                    .await?;
+                let seconds = (position.max(0) as f64) / 1_000_000.0;
+                if !seconds.is_finite() {
+                    return Ok(());
+                }
+                self.backend.seek(seconds, true).await?;
+                self.note_seek(seconds).await;
             }
             Control::SetVolume(volume) => {
+                if !volume.is_finite() {
+                    return Ok(());
+                }
                 self.backend
                     .set_volume((volume * 100.0).clamp(0.0, 150.0))
                     .await?;
@@ -676,27 +734,38 @@ impl App {
                     LoopStatus::Track => RepeatMode::One,
                 };
             }
+            Control::Quit => {
+                self.exit_requested = true;
+            }
         }
         Ok(())
     }
 
-    /// Toggle the active EQ preset on/off. Requires mpv's `af` filter.
+    /// Publish the new position to the MPRIS task so it signals `Seeked`.
+    async fn note_seek(&self, seconds: f64) {
+        if let Some(mpris) = &self.mpris {
+            mpris.note_seek((seconds * 1_000_000.0) as i64).await;
+        }
+    }
+
+    /// Cycle the active EQ preset (off → … → off). Requires mpv's `af` filter.
     pub async fn toggle_eq(&mut self) -> Result<()> {
         if !self.backend.supports_eq() {
             self.show_toast("EQ requires the mpv backend");
             return Ok(());
         }
-        let active = self.cfg.eq.preset.is_some();
-        if active {
-            self.cfg.eq.preset = None;
-            self.backend.set_af("").await?;
-            self.show_toast("EQ: clean");
-        } else if let Some(chain) = self.cfg.active_eq_chain() {
-            let preset_name = self.cfg.eq.preset.clone().unwrap_or_default();
-            self.backend.set_af(&chain).await?;
-            self.show_toast(format!("EQ: {preset_name}"));
-        } else {
-            self.show_toast("no EQ presets configured");
+        match self.cfg.eq.next_preset() {
+            Some(preset_name) => {
+                let chain = self.cfg.eq.chain_for(&preset_name).unwrap_or_default();
+                self.backend.set_af(&chain).await?;
+                self.cfg.eq.preset = Some(preset_name.clone());
+                self.show_toast(format!("EQ: {preset_name}"));
+            }
+            None => {
+                self.cfg.eq.preset = None;
+                self.backend.set_af("").await?;
+                self.show_toast("EQ: clean");
+            }
         }
         if let Err(e) = self.cfg.save() {
             self.show_toast(format!("config write failed: {e}"));
@@ -719,7 +788,7 @@ impl App {
         Ok(())
     }
 
-    /// Rotate which preset is active (currently the first configured one).
+    /// The currently active preset's display string.
     pub fn eq_state(&self) -> String {
         match &self.cfg.eq.preset {
             Some(name) => format!("EQ: {name}"),
@@ -868,7 +937,7 @@ impl App {
     fn current_selected(&self) -> Option<&Track> {
         match self.mode {
             Mode::Search => self.results.get(self.selected),
-            Mode::Queue => self.queue.get(self.cursor),
+            Mode::Queue => self.queue.get(self.queue_sel),
             Mode::PlaylistDetail => self.playlist_tracks.get(self.playlist_cursor),
             Mode::Local => self.local_tracks.get(self.local_cursor),
             Mode::History => self.history.get(self.history_cursor),
@@ -970,7 +1039,7 @@ impl App {
             return Ok(());
         }
         if alt(&key, 'o') || alt(&key, 't') {
-            self.mode = Mode::Queue;
+            self.enter_queue();
             return Ok(());
         }
         if alt(&key, 'L') {
@@ -1069,7 +1138,7 @@ impl App {
             self.enter_playlists();
         }
         if alt(&key, 'o') || alt(&key, 't') {
-            self.mode = Mode::Queue;
+            self.enter_queue();
         }
         if alt(&key, 'y') {
             self.prompt = String::new();
@@ -1139,15 +1208,19 @@ impl App {
                 }
             }
             KeyCode::Char(',') => {
-                let st = self.backend.state();
-                let s = st.read().await;
-                let vol = s.volume - 5.0;
+                let vol = {
+                    let st = self.backend.state();
+                    let s = st.read().await;
+                    s.volume - 5.0
+                };
                 self.backend.set_volume(vol).await?;
             }
             KeyCode::Char('.') => {
-                let st = self.backend.state();
-                let s = st.read().await;
-                let vol = s.volume + 5.0;
+                let vol = {
+                    let st = self.backend.state();
+                    let s = st.read().await;
+                    s.volume + 5.0
+                };
                 self.backend.set_volume(vol).await?;
             }
             _ => {}
@@ -1175,7 +1248,7 @@ impl App {
             self.cycle_repeat();
         }
         if alt(&key, 'd') {
-            self.remove_queue_item(self.cursor);
+            self.remove_queue_item(self.queue_sel);
         }
         if alt(&key, 'R') {
             self.toggle_radio();
@@ -1186,13 +1259,13 @@ impl App {
         match key.code {
             KeyCode::Esc => self.mode = Mode::NowPlaying,
             KeyCode::Up | KeyCode::Char('k') => {
-                self.cursor = self.cursor.saturating_sub(1);
+                self.queue_sel = self.queue_sel.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.cursor = (self.cursor + 1).min(self.queue.len().saturating_sub(1));
+                self.queue_sel = (self.queue_sel + 1).min(self.queue.len().saturating_sub(1));
             }
-            KeyCode::Enter => self.play_queue_item(self.cursor),
-            KeyCode::Delete => self.remove_queue_item(self.cursor),
+            KeyCode::Enter => self.play_queue_item(self.queue_sel),
+            KeyCode::Delete => self.remove_queue_item(self.queue_sel),
             _ => {}
         }
         Ok(())
@@ -1381,6 +1454,7 @@ impl App {
             selected: self.selected,
             queue: self.queue.iter().cloned().collect(),
             cursor: self.cursor,
+            queue_sel: self.queue_sel,
             current: self.current.clone(),
             art: self.current_art.clone(),
             kitty: self.kitty,
@@ -1432,11 +1506,17 @@ impl App {
     /// Take the pending resume-seek position — for the MPD backend, which has no
     /// `FileLoaded` event to trigger the seek on.
     fn take_resume_seek(&mut self) -> Option<f64> {
-        if self.backend.is_mpv() {
+        let take = if self.backend.is_mpv() {
             None
         } else {
             self.resume_position.take()
+        };
+        if self.backend.is_mpv() {
+            // For mpv the position is applied later on `FileLoaded`.
+        } else {
+            self.resume_key = None;
         }
+        take
     }
 
     pub fn apply_session(&mut self, session: &Session) {
@@ -1461,6 +1541,11 @@ impl App {
         }
         if session.position > 3.0 && !self.queue.is_empty() {
             self.resume_position = Some(session.position);
+            self.resume_key = self
+                .current
+                .as_ref()
+                .or_else(|| self.queue.get(self.cursor))
+                .map(Track::key);
         }
     }
 }
@@ -1471,6 +1556,7 @@ pub struct ViewData {
     pub selected: usize,
     pub queue: Vec<Track>,
     pub cursor: usize,
+    pub queue_sel: usize,
     pub current: Option<Track>,
     pub art: Option<ArtRender>,
     pub kitty: bool,

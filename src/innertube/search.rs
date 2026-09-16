@@ -157,6 +157,7 @@ const NON_SONG_CATEGORIES: &[&str] = &[
     "artist",
     "playlist",
     "channel",
+    "profile",
     "community post",
     "post",
     "station",
@@ -267,12 +268,15 @@ fn secondary_from_text(text: &Value) -> ParsedRow {
     }
     if let Some(first) = parts.first()
         && !first.trim().is_empty()
+        && parse_duration(first).is_none()
     {
         row.artist = Some(first.trim().to_string());
     }
     if parts.len() > 1 {
         row.album = Some(parts[1].trim().to_string());
     }
+    // The duration can ride in the secondary column (e.g. "Song • 3:34").
+    row.duration = parse_duration(&joined);
     row
 }
 
@@ -299,10 +303,17 @@ pub fn parse_list_item(renderer: &Value) -> Option<Track> {
     let row = match detail {
         Some(text) => {
             let nav_rows = parse_secondary(text);
-            if nav_rows.artist.is_none() {
-                secondary_from_text(text)
-            } else {
+            // Trust the per-run parse whenever it found anything (current
+            // day/night "Song • duration" rows may only carry a category with
+            // no artist). The text-split fallback handles legacy responses
+            // that attach no navigation to the runs at all.
+            if nav_rows.artist.is_some()
+                || nav_rows.category.is_some()
+                || nav_rows.album.is_some()
+            {
                 nav_rows
+            } else {
+                secondary_from_text(text)
             }
         }
         None => ParsedRow {
@@ -752,6 +763,73 @@ mod tests {
         );
         let items = collect_list_items(&resp);
         assert!(parse_browse_row(items[0]).is_none());
+    }
+
+    #[test]
+    fn parses_day_song_row_with_duration_in_secondary() {
+        // "Today's songs" width: secondary column carries "Song • 3:34" with
+        // no artist navigation and there is no fixed (duration) column. The
+        // duration must come from the secondary text, not be dropped.
+        let resp = json_of(
+            r#"{
+            "contents": {
+                "tabbedSearchResultsRenderer": {
+                    "tabs": [{
+                        "tabRenderer": {
+                            "content": {
+                                "sectionListRenderer": {
+                                    "contents": [{
+                                        "musicShelfRenderer": {
+                                            "contents": [{
+                                                "musicResponsiveListItemRenderer": {
+                                                    "flexColumns": [
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [{
+                                                                        "text": "Falak Dekhun",
+                                                                        "navigationEndpoint": {
+                                                                            "watchEndpoint": {"videoId": "abc123"}
+                                                                        }
+                                                                    }]
+                                                                }
+                                                            }
+                                                        },
+                                                        {
+                                                            "musicResponsiveListItemFlexColumnRenderer": {
+                                                                "text": {
+                                                                    "runs": [{"text": "Song"}, {"text": " • "}, {"text": "3:34"}]
+                                                                }
+                                                            }
+                                                        }
+                                                    ],
+                                                    "thumbnail": {
+                                                        "musicThumbnailRenderer": {
+                                                            "thumbnail": {
+                                                                "thumbnails": [{"url": "//lh3.googleusercontent.com/art/aaa"}]
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }]
+                                        }
+                                    }]
+                                }
+                            }
+                        }
+                    }]
+                }
+            }
+        }"#,
+        );
+        let items = collect_list_items(&resp);
+        let track = parse_list_item(items[0]).unwrap();
+        assert_eq!(track.title, "Falak Dekhun");
+        assert_eq!(track.video_id, "abc123");
+        assert_eq!(track.duration, Some(214));
+        assert_eq!(track.category.as_deref(), Some("Song"));
+        // No artist in the row text; must not turn "3:34" into the artist.
+        assert!(!track.artist.contains(':'));
     }
 
     #[test]

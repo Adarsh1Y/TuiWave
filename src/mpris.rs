@@ -72,6 +72,8 @@ pub struct MprisState {
     pub shuffle: bool,
     /// Normalised to the MPRIS `0.0..=1.0` range.
     pub volume: f64,
+    /// Current playback position in microseconds (0 while stopped).
+    pub position_us: i64,
     pub can_go_next: bool,
     pub can_go_previous: bool,
     pub can_play: bool,
@@ -92,6 +94,7 @@ impl Default for MprisState {
             loop_status: LoopStatus::None,
             shuffle: false,
             volume: 0.0,
+            position_us: 0,
             can_go_next: false,
             can_go_previous: false,
             can_play: false,
@@ -173,6 +176,8 @@ pub enum Control {
     Play,
     Pause,
     Stop,
+    /// Quit the application.
+    Quit,
     /// Relative seek in microseconds.
     Seek(i64),
     /// Absolute position in microseconds.
@@ -187,6 +192,8 @@ pub enum Control {
 #[derive(Clone)]
 pub struct MprisHandle {
     state: Arc<RwLock<MprisState>>,
+    /// One-shot seek announcements; the serve task turns them into `Seeked`.
+    seeked: Arc<std::sync::Mutex<Option<i64>>>,
 }
 
 impl MprisHandle {
@@ -197,29 +204,37 @@ impl MprisHandle {
             *guard = state;
         }
     }
+
+    /// Announce that playback jumped to `position_us` so clients get `Seeked`.
+    pub async fn note_seek(&self, position_us: i64) {
+        *self.seeked.lock().expect("mpvis seek lock") = Some(position_us.max(0));
+    }
 }
 
 /// Start the MPRIS service. Fails silently (returning a live handle) when there
 /// is no session bus, so playback keeps working in headless environments.
 pub fn spawn() -> (MprisHandle, mpsc::UnboundedReceiver<Control>) {
     let state = Arc::new(RwLock::new(MprisState::default()));
+    let seeked = Arc::new(std::sync::Mutex::new(None));
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
     let shared = state.clone();
+    let shared_seeked = seeked.clone();
     tokio::spawn(async move {
-        if let Err(err) = serve(shared, ctrl_tx).await {
+        if let Err(err) = serve(shared, shared_seeked, ctrl_tx).await {
             let _ = err;
         }
     });
-    (MprisHandle { state }, ctrl_rx)
+    (MprisHandle { state, seeked }, ctrl_rx)
 }
 
 async fn serve(
     state: Arc<RwLock<MprisState>>,
+    seeked: Arc<std::sync::Mutex<Option<i64>>>,
     ctrl: mpsc::UnboundedSender<Control>,
 ) -> anyhow::Result<()> {
     let connection = zbus::connection::Builder::session()?
         .name(BUS_NAME)?
-        .serve_at(OBJECT_PATH, Root)?
+        .serve_at(OBJECT_PATH, Root { ctrl: ctrl.clone() })?
         .serve_at(
             OBJECT_PATH,
             Player {
@@ -237,6 +252,23 @@ async fn serve(
 
     loop {
         tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let announced = seeked
+            .lock()
+            .expect("mpris seek lock")
+            .take();
+        if let Some(position_us) = announced {
+            let _ = connection
+                .emit_signal(
+                    None::<zbus::names::BusName<'static>>,
+                    OBJECT_PATH,
+                    PLAYER_IFACE,
+                    "Seeked",
+                    &(position_us,),
+                )
+                .await;
+        }
+
         let current = state.read().await.clone();
 
         if current != last {
@@ -278,6 +310,9 @@ async fn emit_changes(
     if (old.volume - new.volume).abs() > f64::EPSILON {
         changed.insert("Volume", Value::from(new.volume));
     }
+    if (old.position_us - new.position_us).abs() > 500_000 {
+        changed.insert("Position", Value::from(new.position_us));
+    }
     if old.can_go_next != new.can_go_next {
         changed.insert("CanGoNext", Value::from(new.can_go_next));
     }
@@ -313,7 +348,9 @@ async fn emit_changes(
         .await
 }
 
-struct Root;
+struct Root {
+    ctrl: mpsc::UnboundedSender<Control>,
+}
 
 #[interface(name = "org.mpris.MediaPlayer2")]
 impl Root {
@@ -322,7 +359,9 @@ impl Root {
     }
 
     async fn quit(&self) -> fdo::Result<()> {
-        Ok(())
+        self.ctrl
+            .send(Control::Quit)
+            .map_err(|e| fdo::Error::Failed(e.to_string()))
     }
 
     #[zbus(property)]
@@ -470,14 +509,15 @@ impl Player {
 
     #[zbus(property)]
     async fn set_volume(&self, volume: f64) -> fdo::Result<()> {
+        if !volume.is_finite() {
+            return Ok(());
+        }
         self.send(Control::SetVolume(volume.clamp(0.0, 1.0)))
     }
 
     #[zbus(property)]
     async fn position(&self) -> i64 {
-        // Position is polled by clients; the TUI owns the live value.
-        let _ = self.state.read().await;
-        -1
+        self.state.read().await.position_us
     }
 
     #[zbus(property)]

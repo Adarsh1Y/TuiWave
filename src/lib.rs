@@ -1,4 +1,5 @@
 pub mod art;
+pub mod atomic;
 pub mod backend;
 pub mod config;
 pub mod innertube;

@@ -258,20 +258,24 @@ mod tests {
 
     #[test]
     fn kitty_registry_roundtrips() {
+        // Hold the lock for the whole body so a concurrent eviction test can
+        // never remove the entry between insert and read.
+        let mut cache = KITTY_IMAGES.lock().unwrap();
+        cache.clear();
         let img = KittyImage {
             key: "k1".to_owned(),
             width: 2,
             height: 2,
             hex: "aabbcc".to_owned(),
         };
-        register_kitty(&img);
-        let got = kitty_payload("k1").expect("stored");
-        assert_eq!(got.hex, "aabbcc");
-        assert!(kitty_payload("missing").is_none());
+        cache.insert(img.key.clone(), Arc::new(img));
+        assert_eq!(cache.get("k1").map(|i| i.hex.as_str()), Some("aabbcc"));
+        assert!(cache.get("missing").is_none());
     }
 
     #[test]
     fn kitty_registry_evicts_oldest() {
+        KITTY_IMAGES.lock().unwrap().clear();
         for i in 0..(KITTY_CACHE_LIMIT + 3) {
             register_kitty(&KittyImage {
                 key: format!("k{i}"),

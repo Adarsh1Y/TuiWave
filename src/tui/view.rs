@@ -381,7 +381,7 @@ fn draw_queue(frame: &mut Frame, data: &ViewData) {
                 .highlight_style(Style::default().bg(HIGHLIGHT)),
             chunks[1],
             &mut ratatui::widgets::ListState::default()
-                .with_selected(Some(data.cursor.min(data.queue.len().saturating_sub(1)))),
+                .with_selected(Some(data.queue_sel.min(data.queue.len().saturating_sub(1)))),
         );
     }
 
@@ -673,7 +673,7 @@ fn draw_help(frame: &mut Frame) {
         "   alt+y            load a YouTube Music playlist\n",
         "   alt+S            save current queue as playlist\n",
         "   alt+u            local files (FLAC/Opus/MP3)\n",
-        "   alt+e            toggle EQ preset (deep bass)\n",
+        "   alt+e            cycle EQ presets (deep bass/bass boost/rock/…)\n",
         "   alt+x            reset EQ to clean\n",
         "   alt+z            toggle shuffle\n",
         "   alt+r            cycle repeat\n",

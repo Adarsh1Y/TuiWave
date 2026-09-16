@@ -52,9 +52,17 @@ pub async fn post_json(
         .context("innertube request failed")?;
 
     let status = res.status();
+    if !status.is_success() {
+        anyhow::bail!("innertube {endpoint} returned HTTP {status}");
+    }
     let text = res.text().await.context("read innertube response")?;
     let value: Value = serde_json::from_str(&text)
         .with_context(|| format!("innertube returned non-JSON (HTTP {status})"))?;
+    // Some endpoints answer with an error envelope and HTTP 200; treat those
+    // as failures instead of silently yielding empty results.
+    if let Some(code) = value.get("error") {
+        anyhow::bail!("innertube {endpoint} error envelope: {code}");
+    }
     Ok(value)
 }
 

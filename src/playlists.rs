@@ -47,10 +47,7 @@ pub fn load_liked() -> anyhow::Result<Vec<Track>> {
 
 pub fn save_liked(tracks: &[Track]) -> anyhow::Result<()> {
     let path = liked_path()?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(tracks)?)?;
+    crate::atomic::atomic_write(&path, serde_json::to_string_pretty(tracks)?.as_bytes())?;
     Ok(())
 }
 
@@ -80,10 +77,7 @@ pub fn load_playlist(name: &str) -> anyhow::Result<Vec<Track>> {
 
 pub fn save_playlist(name: &str, tracks: &[Track]) -> anyhow::Result<()> {
     let path = playlist_path(name)?;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(tracks)?)?;
+    crate::atomic::atomic_write(&path, serde_json::to_string_pretty(tracks)?.as_bytes())?;
     Ok(())
 }
 

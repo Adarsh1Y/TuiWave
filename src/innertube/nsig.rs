@@ -457,6 +457,8 @@ fn run_n_function(js: &str, challenge: &str) -> Result<Option<String>> {
 fn execute_body(body: &str, input: &str) -> Result<String> {
     use rquickjs::{Context, Runtime, Value};
     let rt = Runtime::new().context("create quickjs runtime")?;
+    // `Context::base` registers only the base objects (no eval/statement
+    // support), so the full context is required to actually run candidates.
     let ctx = Context::full(&rt).context("create quickjs context")?;
     ctx.with(|ctx| -> Result<String> {
         let src = format!("((a) => {{ {body}; return a; }})");

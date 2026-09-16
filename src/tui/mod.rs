@@ -104,10 +104,21 @@ pub async fn run(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let (app_tx, mut app_rx) = mpsc::unbounded_channel();
-    let mut app_state = app::App::new(cfg.clone(), backend, app_tx, kitty, cell_w, cell_h);
+    let (mpris, mut mpris_rx) = crate::mpris::spawn();
+    let mut app_state = app::App::new(
+        cfg.clone(),
+        backend,
+        app_tx,
+        Some(mpris.clone()),
+        kitty,
+        cell_w,
+        cell_h,
+    );
     let mut error = None;
 
-    let (mpris, mut mpris_rx) = crate::mpris::spawn();
+    // The MPRIS sender only closes when the service failed to start (no session
+    // bus). Once closed, stop polling the channel instead of busy-spinning.
+    let mut mpris_closed = false;
 
     if resume
         && let Some(session) = crate::state::Session::load()
@@ -158,6 +169,14 @@ pub async fn run(
             }
         }
 
+        let ctrl_fut: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<crate::mpris::Control>> + '_>,
+        > = if mpris_closed {
+            Box::pin(std::future::pending())
+        } else {
+            Box::pin(mpris_rx.recv())
+        };
+
         tokio::select! {
             ev = input.next() => {
                 match ev {
@@ -184,12 +203,20 @@ pub async fn run(
                     app_state.handle_event(ev);
                 }
             }
-            ctrl = mpris_rx.recv() => {
-                if let Some(ctrl) = ctrl
-                    && let Err(e) = app_state.handle_mpris(ctrl).await
-                {
-                    error = Some(e);
-                    break;
+            ctrl = ctrl_fut => {
+                match ctrl {
+                    Some(ctrl) => {
+                        // External control must never take the app down; surface
+                        // failures as a toast and keep playing.
+                        if let Err(e) = app_state.handle_mpris(ctrl).await {
+                            app_state.show_toast(format!("mpris: {e:#}"));
+                        }
+                        if app_state.exit_requested {
+                            error = Some(anyhow::anyhow!("quit"));
+                            break;
+                        }
+                    }
+                    None => mpris_closed = true,
                 }
             }
             ev = backend_events.recv() => {

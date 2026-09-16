@@ -128,34 +128,98 @@ async fn browse(
 }
 
 /// The `musicPlaylistShelfRenderer` carrying the track list. Playlists return
-/// either a single-column (mobile) or two-column (desktop web) layout.
+/// either a single-column (mobile) or two-column (desktop web) layout, while
+/// continuation pages put the next batch under `continuationContents` and
+/// can also arrive as `onResponseReceivedActions`/`Endpoints` append actions.
 fn shelf(root: &Value) -> Option<&Value> {
-    root
-        .pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicPlaylistShelfRenderer")
+    root.pointer("/contents/singleColumnBrowseResultsRenderer/tabs/0/tabRenderer/content/sectionListRenderer/contents/0/musicPlaylistShelfRenderer")
         .or_else(|| {
             root.pointer("/contents/twoColumnBrowseResultsRenderer/secondaryContents/sectionListRenderer/contents/0/musicPlaylistShelfRenderer")
         })
+        .or_else(|| root.pointer("/continuationContents/musicPlaylistShelfContinuation"))
 }
 
-/// Tracks from the initial `musicPlaylistShelfRenderer` contents.
+/// Tracks from the initial `musicPlaylistShelfRenderer` contents and from any
+/// `appendContinuationItemsAction` continuation payloads.
 fn collect_playlist_tracks(root: &Value) -> Vec<Track> {
-    let Some(item_renders) = shelf(root)
+    let mut out = Vec::new();
+    if let Some(item_renders) = shelf(root)
         .and_then(|s| s.get("contents"))
         .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
-    item_renders
-        .iter()
-        .filter_map(|it| {
-            let renderer = it.get("musicResponsiveListItemRenderer")?;
-            super::search::parse_list_item(renderer)
-        })
-        .collect()
+    {
+        out.extend(item_renders.iter().filter_map(parse_row_json));
+    }
+    for items in append_continuation_items(root) {
+        if let Some(arr) = items.as_array() {
+            out.extend(arr.iter().filter_map(parse_row_json));
+        }
+    }
+    out
+}
+
+/// Parse a track from a `musicResponsiveListItemRenderer` wrapper.
+fn parse_row_json(item: &Value) -> Option<Track> {
+    let renderer = item.get("musicResponsiveListItemRenderer")?;
+    super::search::parse_list_item(renderer)
+}
+
+/// `continuationItems` of every `appendContinuationItemsAction` /
+/// `appendContinuationItemAction` anywhere in the response.
+fn append_continuation_items(root: &Value) -> Vec<&Value> {
+    let mut out = Vec::new();
+    fn walk<'a>(node: &'a Value, out: &mut Vec<&'a Value>) {
+        match node {
+            Value::Object(map) => {
+                if let Some(items) = map
+                    .get("appendContinuationItemsAction")
+                    .or_else(|| map.get("appendContinuationItemAction"))
+                    .and_then(|a| a.get("continuationItems"))
+                {
+                    out.push(items);
+                }
+                for v in map.values() {
+                    walk(v, out);
+                }
+            }
+            Value::Array(arr) => {
+                for v in arr {
+                    walk(v, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(root, &mut out);
+    out
 }
 
 fn continuation_token(root: &Value) -> Option<String> {
-    let cont = shelf(root)?.get("continuations")?.as_array()?;
+    // Shelf continuations (initial page and continuationContents pages).
+    if let Some(cont) = shelf(root)
+        .and_then(|s| s.get("continuations"))
+        .and_then(Value::as_array)
+        && let Some(t) = next_continuation_token(cont)
+    {
+        return Some(t);
+    }
+    // Append-action continuations carry the next token in a trailing
+    // continuationItemRenderer.
+    for items in append_continuation_items(root) {
+        if let Some(arr) = items.as_array() {
+            for item in arr {
+                if let Some(t) = item
+                    .pointer("/continuationItemRenderer/continuationEndpoint/continuationCommand/token")
+                    .and_then(Value::as_str)
+                {
+                    return Some(t.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn next_continuation_token(cont: &[Value]) -> Option<String> {
     for c in cont {
         if let Some(t) = c
             .pointer("/nextContinuationData/continuation")
@@ -230,6 +294,40 @@ mod tests {
         assert_eq!(tracks[0].title, "Song A");
         assert_eq!(continuation_token(&root).as_deref(), Some("TOK123"));
         assert_eq!(playlist_title(&root).as_deref(), Some("My Mix"));
+    }
+
+    #[test]
+    fn parses_continuation_contents_page() {
+        // A continuation page arrives as `continuationContents` (no shelf
+        // tree) with the next token in an appendContinuationItemsAction.
+        let root = json_of(r#"{
+            "continuationContents": {"musicPlaylistShelfContinuation": {
+                "contents": [{"musicResponsiveListItemRenderer": {"flexColumns": [
+                    {"musicResponsiveListItemFlexColumnRenderer": {"text": {
+                        "runs": [{"text": "Page Two", "navigationEndpoint": {"watchEndpoint": {"videoId": "CCCCCCCCCCC"}}}]
+                    }}},
+                    {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Artist C · Album C"}]}}}
+                ]}}]
+            }},
+            "onResponseReceivedActions": [{"appendContinuationItemsAction": {
+                "continuationItems": [
+                    {"musicResponsiveListItemRenderer": {"flexColumns": [
+                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {
+                            "runs": [{"text": "From Action", "navigationEndpoint": {"watchEndpoint": {"videoId": "DDDDDDDDDDD"}}}]
+                        }}},
+                        {"musicResponsiveListItemFlexColumnRenderer": {"text": {"runs": [{"text": "Artist D"}]}}}
+                    ]}},
+                    {"continuationItemRenderer": {"continuationEndpoint": {
+                        "continuationCommand": {"token": "ACTION_TOKEN"}
+                    }}}
+                ]
+            }}]
+        }"#);
+        let tracks = collect_playlist_tracks(&root);
+        assert_eq!(tracks.len(), 2);
+        assert_eq!(tracks[0].video_id, "CCCCCCCCCCC");
+        assert_eq!(tracks[1].video_id, "DDDDDDDDDDD");
+        assert_eq!(continuation_token(&root).as_deref(), Some("ACTION_TOKEN"));
     }
 
     #[test]

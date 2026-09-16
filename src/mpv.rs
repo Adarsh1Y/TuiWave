@@ -141,7 +141,7 @@ impl Mpv {
 
     pub async fn seek(&self, seconds: f64, absolute: bool) -> anyhow::Result<()> {
         let mode = if absolute {
-            "absolute-second"
+            "absolute"
         } else {
             "relative"
         };
@@ -150,8 +150,12 @@ impl Mpv {
     }
 
     pub async fn set_volume(&self, volume: f64) -> anyhow::Result<()> {
-        self.command_raw(json!(["set_property", "volume", volume.clamp(0.0, 150.0)]))
-            .await?;
+        let v = if volume.is_finite() {
+            volume.clamp(0.0, 150.0)
+        } else {
+            0.0
+        };
+        self.command_raw(json!(["set_property", "volume", v])).await?;
         Ok(())
     }
 
@@ -263,9 +267,17 @@ impl Mpv {
             Ok(Ok(())) => {}
         }
 
-        let value = tokio::time::timeout(COMMAND_TIMEOUT, rx)
-            .await
-            .map_err(|_| anyhow::anyhow!("mpv did not answer within {COMMAND_TIMEOUT:?}"))??;
+        let value = match tokio::time::timeout(COMMAND_TIMEOUT, rx).await {
+            Ok(Ok(v)) => v,
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                anyhow::bail!("mpv did not answer within {:?}", COMMAND_TIMEOUT);
+            }
+            Ok(Err(_)) => {
+                self.pending.lock().await.remove(&id);
+                anyhow::bail!("mpv socket closed while waiting for a reply");
+            }
+        };
         let error = value
             .get("error")
             .and_then(Value::as_str)
@@ -335,7 +347,7 @@ async fn reader_loop(
                     "time-pos" => s.time_pos = data.and_then(Value::as_f64).filter(|v| *v >= 0.0),
                     "duration" => s.duration = data.and_then(Value::as_f64),
                     "pause" => s.paused = data.and_then(Value::as_bool).unwrap_or(false),
-                    "idle" => s.idle = data.and_then(Value::as_bool).unwrap_or(true),
+                    "idle-active" => s.idle = data.and_then(Value::as_bool).unwrap_or(true),
                     "volume" => s.volume = data.and_then(Value::as_f64).unwrap_or(0.0),
                     "media-title" => {
                         s.media_title = data.and_then(Value::as_str).map(str::to_string)

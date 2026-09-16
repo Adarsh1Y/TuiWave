@@ -103,8 +103,9 @@ const CLIENTS: [ClientDef; 3] = [
 ];
 
 /// Preferred audio itags (highest quality first) as a tiebreaker after codec
-/// family. VISIONOS serves opus (251) in addition to the m4a family (140/141).
-const PREFERRED_ITAGS: [u32; 4] = [251, 140, 141, 139];
+/// family. VISIONOS serves opus (251) in addition to the m4a family (141 is
+/// the 256 kbps AAC, 140 the 128 kbps one).
+const PREFERRED_ITAGS: [u32; 4] = [251, 141, 140, 139];
 
 /// Resolve a playable, download-verified stream URL for a video id.
 ///
@@ -127,7 +128,12 @@ pub async fn resolve_stream(
 ) -> anyhow::Result<StreamFormat> {
     for def in CLIENTS {
         for attempt in 0..2 {
-            let value = player_request(client, cfg, video_id, &def).await?;
+            // A broken request (network error, non-JSON reply, HTTP 5xx) only
+            // disqualifies this client; the fallback chain continues.
+            let value = match player_request(client, cfg, video_id, &def).await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
             if is_login_required(&value) {
                 if attempt == 0 {
                     *cfg = super::config::scrape().await;
@@ -211,7 +217,31 @@ async fn verify_url(client: &Client, url: &str) -> bool {
         Err(_) => return false,
     };
     let status = res.status();
-    status.is_success() || status == reqwest::StatusCode::PARTIAL_CONTENT
+    if !(status.is_success() || status == reqwest::StatusCode::PARTIAL_CONTENT) {
+        return false;
+    }
+    // A bot-gate answers the ranged GET with HTTP 200 and an HTML "blocked"
+    // page; real audio always advertises a media type.
+    let ctype = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ctype.starts_with("text/") || ctype.contains("html") {
+        return false;
+    }
+    // When the server declares a length, it must be non-empty.
+    if let Some(len) = res
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        && len == 0
+    {
+        return false;
+    }
+    true
 }
 
 /// Pick the best audio-only format from an adaptiveFormats list.

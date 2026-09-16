@@ -6,7 +6,7 @@ use tokio::net::tcp::{OwnedReadHalf as TcpRead, OwnedWriteHalf as TcpWrite};
 use tokio::net::unix::{OwnedReadHalf as UnixRead, OwnedWriteHalf as UnixWrite};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{RwLock, mpsc, oneshot};
-use tokio::time::{Duration, MissedTickBehavior};
+use tokio::time::Duration;
 
 use crate::config::MpdConfig;
 use crate::mpv::{MpvEvent, PlaybackState};
@@ -25,13 +25,19 @@ enum WriteHalf {
 
 impl WriteHalf {
     async fn write_line(&mut self, s: &str) -> std::io::Result<()> {
+        // The MPD protocol is line-based; every command must end in "\n".
+        let line: Vec<u8> = if s.ends_with('\n') {
+            s.as_bytes().to_vec()
+        } else {
+            format!("{s}\n").into_bytes()
+        };
         match self {
             Self::Tcp(w) => {
-                w.write_all(s.as_bytes()).await?;
+                w.write_all(&line).await?;
                 w.flush().await?;
             }
             Self::Unix(w) => {
-                w.write_all(s.as_bytes()).await?;
+                w.write_all(&line).await?;
                 w.flush().await?;
             }
         }
@@ -137,12 +143,23 @@ impl MpdClient {
         self.cmd("pause").await.map(|_| ())
     }
 
-    pub async fn seek(&self, seconds: f64, _absolute: bool) -> anyhow::Result<()> {
-        self.cmd(&format!("seekcur {seconds}\n")).await.map(|_| ())
+    pub async fn seek(&self, seconds: f64, absolute: bool) -> anyhow::Result<()> {
+        let cmd = if absolute {
+            format!("seekcur {seconds}\n")
+        } else {
+            // MPD's `seekcur` is absolute; relative seeks need ±N.
+            let sign = if seconds >= 0.0 { "+" } else { "-" };
+            format!("seekcur {sign}{}\n", seconds.abs())
+        };
+        self.cmd(&cmd).await.map(|_| ())
     }
 
     pub async fn set_volume(&self, volume: f64) -> anyhow::Result<()> {
-        let v = volume.clamp(0.0, 100.0) as u32;
+        let v = if volume.is_finite() {
+            volume.clamp(0.0, 100.0) as u32
+        } else {
+            0
+        };
         self.cmd(&format!("setvol {v}\n")).await.map(|_| ())
     }
 
@@ -164,13 +181,15 @@ fn escape(s: &str) -> String {
 }
 
 /// Read a reply: collect lines until `OK` (Ok(true)) or `ACK ...` (Ok(false)).
-async fn read_reply(read: &mut ReadHalf, lines: &mut Vec<String>) -> std::io::Result<bool> {
+/// An EOF surfaces as an error so the agent can tear down and let the caller
+/// reconnect, instead of pretending the connection is healthy.
+async fn read_reply(read: &mut ReadHalf, lines: &mut Vec<String>) -> anyhow::Result<bool> {
     let mut buf = String::new();
     loop {
         buf.clear();
         let n = read.read_line(&mut buf).await?;
         if n == 0 {
-            return Ok(true); // EOF: pretend success so polling stops cleanly
+            anyhow::bail!("MPD connection closed by server");
         }
         let trimmed = buf.trim_end();
         if trimmed == "OK" {
@@ -209,10 +228,10 @@ fn unescape(s: &str) -> String {
 }
 
 /// Poll `status` once; returns parsed key/values.
-async fn poll_status(name_lines: &mut ReadHalf, write: &mut WriteHalf) -> anyhow::Result<Vec<String>> {
-    write.write_line("status\n").await?;
+async fn poll_status(wire_read: &mut ReadHalf, write: &mut WriteHalf) -> anyhow::Result<Vec<String>> {
+    write.write_line("status").await?;
     let mut lines = Vec::new();
-    let ok = read_reply(name_lines, &mut lines).await?;
+    let ok = read_reply(wire_read, &mut lines).await?;
     if !ok {
         anyhow::bail!("MPD status ACKed");
     }
@@ -221,12 +240,12 @@ async fn poll_status(name_lines: &mut ReadHalf, write: &mut WriteHalf) -> anyhow
 
 /// Poll `currentsong` once; returns "key: value" lines.
 async fn poll_current(
-    name_lines: &mut ReadHalf,
+    wire_read: &mut ReadHalf,
     write: &mut WriteHalf,
 ) -> anyhow::Result<Vec<String>> {
-    write.write_line("currentsong\n").await?;
+    write.write_line("currentsong").await?;
     let mut lines = Vec::new();
-    let ok = read_reply(name_lines, &mut lines).await?;
+    let ok = read_reply(wire_read, &mut lines).await?;
     if !ok {
         anyhow::bail!("MPD currentsong ACKed");
     }
@@ -245,100 +264,127 @@ async fn agent_loop(
     state: Arc<RwLock<PlaybackState>>,
     event_tx: mpsc::UnboundedSender<MpvEvent>,
 ) {
-    let mut poll = tokio::time::interval(POLL_INTERVAL);
-    poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
     let mut armed = false; // a URL was loaded; watch for its end/error
     let mut was_playing = false;
 
+    // MPD is a strict command/reply protocol over one socket, so every
+    // exchange — customer commands and our periodic status polls alike — must
+    // run to completion one at a time. Interleaving them (or cancelling a
+    // wait midway) would misattribute replies. `timeout(...)` yields to a poll
+    // only when no command is outstanding.
     loop {
-        tokio::select! {
-            cmd = reqs.recv() => {
-                let Some((cmd, reply)) = cmd else { break };
-                let result = async {
-                    let mut lines = Vec::new();
-                    write.write_line(&cmd).await?;
-                    let ok = read_reply(&mut read, &mut lines).await?;
-                    if !ok {
-                        anyhow::bail!("MPD: {}", lines.first().cloned().unwrap_or_default());
-                    }
-                    Ok(lines)
-                }
-                .await;
-                if cmd.starts_with("clear") || cmd.starts_with("play") || cmd.starts_with("pause 0") {
+        match tokio::time::timeout(POLL_INTERVAL, reqs.recv()).await {
+            Ok(Some((cmd, reply))) => {
+                let result = exchange(&mut read, &mut write, &cmd).await;
+                if cmd == "clear"
+                    || cmd == "play"
+                    || cmd.starts_with("play ")
+                    || cmd.starts_with("pause 0")
+                {
+                    // A new track is coming: forget the previous one so its
+                    // title/duration don't bleed into the next load.
                     armed = true;
                     was_playing = false;
+                    let mut s = state.write().await;
+                    s.media_title = None;
+                    s.duration = None;
+                    s.time_pos = None;
+                    s.idle = false;
+                    s.paused = false;
                 }
                 let _ = reply.send(result);
             }
-            _ = poll.tick() => {
-                let status = match poll_status(&mut read, &mut write).await {
-                    Ok(lines) => lines,
-                    Err(_) => continue,
-                };
-                let current = match poll_current(&mut read, &mut write).await {
-                    Ok(lines) => lines,
-                    Err(_) => continue,
-                };
-
-                let mut volume = 0.0;
-                let mut elapsed = None;
-                let mut stopped = true;
-                let mut error = None;
-                for l in &status {
-                    if let Some((k, v)) = kv(l) {
-                        match k {
-                            "volume" => volume = v.parse().unwrap_or(0.0),
-                            "elapsed" => elapsed = v.parse().ok(),
-                            "state" => stopped = v != "play" && v != "pause",
-                            "error" if !v.is_empty() => error = Some(v.to_string()),
-                            _ => {}
-                        }
-                    }
-                }
-
-                let mut title: Option<String> = None;
-                let mut duration: Option<f64> = None;
-                for l in &current {
-                    if let Some((k, v)) = kv(l) {
-                        if k == "Title" && title.is_none() {
-                            title = Some(v.to_string());
-                        } else if (k == "Duration" || k == "Time") && duration.is_none() {
-                            duration = v.parse().ok();
-                        }
-                    }
-                }
-
+            Ok(None) => break, // all senders dropped (shutdown)
+            Err(_) => {
+                if poll_tick(&mut read, &mut write, &state, &event_tx, &mut armed, &mut was_playing)
+                    .await
+                    .is_err()
                 {
-                    let mut s = state.write().await;
-                    s.volume = volume;
-                    s.time_pos = elapsed;
-                    s.paused = !stopped && status.iter().any(|l| kv(l).is_some_and(|(k, v)| k == "state" && v == "pause"));
-                    s.idle = stopped;
-                    s.duration = duration.or(s.duration);
-                    if title.is_some() {
-                        s.media_title = title.clone();
-                    }
-                }
-
-                if armed {
-                    if let Some(err) = error {
-                        let _ = event_tx.send(MpvEvent::EndFile { reason: "error".into() });
-                        let _ = err;
-                        armed = false;
-                        was_playing = false;
-                    } else if stopped && was_playing {
-                        let _ = event_tx.send(MpvEvent::EndFile { reason: "end-of-file".into() });
-                        armed = false;
-                        was_playing = false;
-                    }
-                }
-                if !stopped {
-                    was_playing = true;
+                    break; // server closed the socket: surface it to callers
                 }
             }
         }
     }
+}
+
+/// Run one command against the socket, returning the reply lines.
+async fn exchange(read: &mut ReadHalf, write: &mut WriteHalf, cmd: &str) -> anyhow::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    write.write_line(cmd).await?;
+    let ok = read_reply(read, &mut lines).await?;
+    if !ok {
+        anyhow::bail!("MPD: {}", lines.first().cloned().unwrap_or_default());
+    }
+    Ok(lines)
+}
+
+/// Poll `status` + `currentsong`, refresh the shared state, and translate
+/// track/error transitions into events.
+async fn poll_tick(
+    read: &mut ReadHalf,
+    write: &mut WriteHalf,
+    state: &Arc<RwLock<PlaybackState>>,
+    event_tx: &mpsc::UnboundedSender<MpvEvent>,
+    armed: &mut bool,
+    was_playing: &mut bool,
+) -> anyhow::Result<()> {
+    let status = poll_status(read, write).await?;
+    let current = poll_current(read, write).await?;
+
+    let mut volume = 0.0;
+    let mut elapsed = None;
+    let mut stopped = true;
+    let mut error = None;
+    for l in &status {
+        if let Some((k, v)) = kv(l) {
+            match k {
+                "volume" => volume = v.parse().unwrap_or(0.0),
+                "elapsed" => elapsed = v.parse().ok(),
+                "state" => stopped = v != "play" && v != "pause",
+                "error" if !v.is_empty() => error = Some(v.to_string()),
+                _ => {}
+            }
+        }
+    }
+
+    let mut title: Option<String> = None;
+    let mut duration: Option<f64> = None;
+    for l in &current {
+        if let Some((k, v)) = kv(l) {
+            if k == "Title" && title.is_none() {
+                title = Some(v.to_string());
+            } else if (k == "Duration" || k == "Time") && duration.is_none() {
+                duration = v.parse().ok();
+            }
+        }
+    }
+
+    {
+        let mut s = state.write().await;
+        s.volume = volume;
+        s.time_pos = elapsed;
+        s.paused = !stopped && status.iter().any(|l| kv(l).is_some_and(|(k, v)| k == "state" && v == "pause"));
+        s.idle = stopped;
+        s.duration = duration;
+        s.media_title = title;
+    }
+
+    if *armed {
+        if let Some(err) = error {
+            let _ = event_tx.send(MpvEvent::EndFile { reason: "error".into() });
+            let _ = err;
+            *armed = false;
+            *was_playing = false;
+        } else if stopped && *was_playing {
+            let _ = event_tx.send(MpvEvent::EndFile { reason: "end-of-file".into() });
+            *armed = false;
+            *was_playing = false;
+        }
+    }
+    if !stopped {
+        *was_playing = true;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -44,11 +44,8 @@ impl Session {
 
     pub fn save(&self) {
         let Ok(path) = Self::path() else { return };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
         if let Ok(json) = serde_json::to_string(self) {
-            let _ = std::fs::write(&path, json);
+            let _ = crate::atomic::atomic_write(&path, json.as_bytes());
         }
     }
 
